@@ -1,0 +1,22 @@
+{
+  "name": "web-scrapper",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "install:browsers": "npx playwright install chromium",
+    "scrape": "npm run build && node --enable-source-maps apps/scraper/dist/apps/scraper/src/index.js",
+    "typecheck": "npm run typecheck --workspaces"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.10",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
