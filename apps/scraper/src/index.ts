@@ -1,8 +1,9 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { chromium, type Browser, type BrowserContext, type Page } from "@playwright/test";
 import {
+  DEFAULT_TRACKING_FILE,
   DEFAULT_OUTPUT_DIR,
   TARGET_URL
 } from "@web-scrapper/config";
@@ -10,6 +11,7 @@ import {
 type CliOptions = {
   headless: boolean;
   outputDir: string;
+  trackingFile: string;
   url: string;
 };
 
@@ -24,6 +26,14 @@ type ExtractionResult = {
   footerContent: string | null;
 };
 
+type ScrapedUrlRecord = {
+  outputPath: string;
+  scrapedAt: string;
+  sourceUrl: string;
+};
+
+type ScrapedUrlRegistry = Record<string, ScrapedUrlRecord>;
+
 const SECURITY_VERIFICATION_PATTERNS = [
   "performing security verification",
   "verifies you are not a bot",
@@ -36,16 +46,34 @@ const SECURITY_VERIFICATION_PATTERNS = [
 async function main(): Promise<void> {
   const options = parseCliArgs(process.argv.slice(2));
   const outputDir = path.resolve(process.cwd(), options.outputDir);
+  const trackingFile = path.resolve(process.cwd(), options.trackingFile);
 
   await mkdir(outputDir, { recursive: true });
+
+  const article = createSingleArticle(options.url);
+  const registry = await readTrackingRegistry(trackingFile);
+  const existingRecord = registry[article.sourceUrl];
+
+  if (existingRecord) {
+    console.log(`Skipping already scraped URL: ${article.sourceUrl}`);
+    console.log(`Existing file: ${existingRecord.outputPath}`);
+    return;
+  }
 
   const browser = await chromium.launch({ headless: options.headless });
   const context = await browser.newContext();
 
   try {
-    const article = createSingleArticle(options.url);
     const result = await extractArticleContent(context, article, outputDir, 1);
     const outputPath = await writeExtraction(outputDir, result, 1);
+    await writeTrackingRegistry(trackingFile, {
+      ...registry,
+      [article.sourceUrl]: {
+        outputPath,
+        scrapedAt: new Date().toISOString(),
+        sourceUrl: article.sourceUrl
+      }
+    });
     console.log(`Saved 1/1: ${outputPath}`);
     console.log(`Completed 1 file in ${outputDir}`);
   } finally {
@@ -57,6 +85,7 @@ function parseCliArgs(args: string[]): CliOptions {
   let url: string | null = null;
   let headless = true;
   let outputDir = DEFAULT_OUTPUT_DIR;
+  let trackingFile = DEFAULT_TRACKING_FILE;
 
   for (const arg of args) {
     if (arg === "--headless=false") {
@@ -79,6 +108,15 @@ function parseCliArgs(args: string[]): CliOptions {
         throw new Error("Missing value for --url.");
       }
       url = value;
+      continue;
+    }
+
+    if (arg.startsWith("--trackingFile=")) {
+      const value = arg.slice("--trackingFile=".length).trim();
+      if (!value) {
+        throw new Error("Missing value for --trackingFile.");
+      }
+      trackingFile = value;
     }
   }
 
@@ -89,8 +127,34 @@ function parseCliArgs(args: string[]): CliOptions {
   return {
     headless,
     outputDir,
+    trackingFile,
     url
   };
+}
+
+async function readTrackingRegistry(trackingFile: string): Promise<ScrapedUrlRegistry> {
+  const content = await readFile(trackingFile, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  });
+
+  if (content === null) {
+    return {};
+  }
+
+  const parsed = JSON.parse(content) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid tracking file format: ${trackingFile}`);
+  }
+
+  return parsed as ScrapedUrlRegistry;
+}
+
+async function writeTrackingRegistry(trackingFile: string, registry: ScrapedUrlRegistry): Promise<void> {
+  await mkdir(path.dirname(trackingFile), { recursive: true });
+  await writeFile(trackingFile, `${JSON.stringify(registry, null, 2)}\n`, "utf8");
 }
 
 function createSingleArticle(inputUrl: string): Article {
