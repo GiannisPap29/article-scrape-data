@@ -1,18 +1,28 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import process from "node:process";
-import { chromium, type Browser, type BrowserContext, type Page } from "@playwright/test";
+import { DatabaseSync } from "node:sqlite";
+import { chromium, firefox, webkit, type BrowserContext, type Page } from "@playwright/test";
 import {
-  DEFAULT_TRACKING_FILE,
+  DEFAULT_DB_FILE,
   DEFAULT_OUTPUT_DIR,
   TARGET_URL
 } from "@web-scrapper/config";
 
+type BrowserName = "chrome" | "msedge" | "firefox" | "webkit";
+type Command = "scrape" | "serve" | "reset";
+
 type CliOptions = {
+  browser: BrowserName;
+  command: Command;
+  connectUrl: string | null;
   headless: boolean;
   outputDir: string;
-  trackingFile: string;
-  url: string;
+  port: number;
+  dbFile: string;
+  url: string | null;
 };
 
 type Article = {
@@ -26,13 +36,24 @@ type ExtractionResult = {
   footerContent: string | null;
 };
 
+type ScrapeResult = {
+  outputPath: string;
+  sourceUrl: string;
+  status: "saved" | "skipped";
+};
+
+type BatchScrapeSummary = {
+  failed: Array<{ error: string; inputUrl: string; }>;
+  saved: ScrapeResult[];
+  skipped: ScrapeResult[];
+  total: number;
+};
+
 type ScrapedUrlRecord = {
   outputPath: string;
   scrapedAt: string;
   sourceUrl: string;
 };
-
-type ScrapedUrlRegistry = Record<string, ScrapedUrlRecord>;
 
 const SECURITY_VERIFICATION_PATTERNS = [
   "performing security verification",
@@ -45,51 +66,67 @@ const SECURITY_VERIFICATION_PATTERNS = [
 
 async function main(): Promise<void> {
   const options = parseCliArgs(process.argv.slice(2));
-  const outputDir = path.resolve(process.cwd(), options.outputDir);
-  const trackingFile = path.resolve(process.cwd(), options.trackingFile);
 
-  await mkdir(outputDir, { recursive: true });
-
-  const article = createSingleArticle(options.url);
-  const registry = await readTrackingRegistry(trackingFile);
-  const existingRecord = registry[article.sourceUrl];
-
-  if (existingRecord) {
-    console.log(`Skipping already scraped URL: ${article.sourceUrl}`);
-    console.log(`Existing file: ${existingRecord.outputPath}`);
+  if (options.command === "serve") {
+    await startUiServer(options);
     return;
   }
 
-  const browser = await chromium.launch({ headless: options.headless });
-  const context = await browser.newContext();
-
-  try {
-    const result = await extractArticleContent(context, article, outputDir, 1);
-    const outputPath = await writeExtraction(outputDir, result, 1);
-    await writeTrackingRegistry(trackingFile, {
-      ...registry,
-      [article.sourceUrl]: {
-        outputPath,
-        scrapedAt: new Date().toISOString(),
-        sourceUrl: article.sourceUrl
-      }
-    });
-    console.log(`Saved 1/1: ${outputPath}`);
-    console.log(`Completed 1 file in ${outputDir}`);
-  } finally {
-    await browser.close();
+  if (options.command === "reset") {
+    resetTrackingDatabase(path.resolve(process.cwd(), options.dbFile));
+    console.log(`Reset tracking database: ${path.resolve(process.cwd(), options.dbFile)}`);
+    return;
   }
+
+  if (!options.url) {
+    throw new Error("Missing required --url value.");
+  }
+
+  const summary = await scrapeUrls([options.url], options);
+  printBatchSummary(summary);
 }
 
 function parseCliArgs(args: string[]): CliOptions {
-  let url: string | null = null;
+  let browser: BrowserName = "chrome";
+  let command: Command = "scrape";
+  let connectUrl: string | null = null;
   let headless = true;
   let outputDir = DEFAULT_OUTPUT_DIR;
-  let trackingFile = DEFAULT_TRACKING_FILE;
+  let port = 3000;
+  let dbFile = DEFAULT_DB_FILE;
+  let url: string | null = null;
 
   for (const arg of args) {
+    if (arg === "--serve") {
+      command = "serve";
+      continue;
+    }
+
+    if (arg === "--reset") {
+      command = "reset";
+      continue;
+    }
+
     if (arg === "--headless=false") {
       headless = false;
+      continue;
+    }
+
+    if (arg.startsWith("--browser=")) {
+      const value = arg.slice("--browser=".length).trim();
+      if (value !== "chrome" && value !== "msedge" && value !== "firefox" && value !== "webkit") {
+        throw new Error(`Invalid --browser value: ${arg}`);
+      }
+      browser = value;
+      continue;
+    }
+
+    if (arg.startsWith("--connectUrl=")) {
+      const value = arg.slice("--connectUrl=".length).trim();
+      if (!value) {
+        throw new Error("Missing value for --connectUrl.");
+      }
+      connectUrl = value;
       continue;
     }
 
@@ -102,12 +139,8 @@ function parseCliArgs(args: string[]): CliOptions {
       continue;
     }
 
-    if (arg.startsWith("--url=")) {
-      const value = arg.slice("--url=".length).trim();
-      if (!value) {
-        throw new Error("Missing value for --url.");
-      }
-      url = value;
+    if (arg.startsWith("--port=")) {
+      port = parsePositiveInteger(arg, "--port");
       continue;
     }
 
@@ -116,51 +149,370 @@ function parseCliArgs(args: string[]): CliOptions {
       if (!value) {
         throw new Error("Missing value for --trackingFile.");
       }
-      trackingFile = value;
+      dbFile = value;
+      continue;
+    }
+
+    if (arg.startsWith("--dbFile=")) {
+      const value = arg.slice("--dbFile=".length).trim();
+      if (!value) {
+        throw new Error("Missing value for --dbFile.");
+      }
+      dbFile = value;
+      continue;
+    }
+
+    if (arg.startsWith("--url=")) {
+      const value = arg.slice("--url=".length).trim();
+      if (!value) {
+        throw new Error("Missing value for --url.");
+      }
+      url = value;
     }
   }
 
-  if (!url) {
-    throw new Error("Missing required --url value.");
-  }
-
   return {
+    browser,
+    command,
+    connectUrl,
     headless,
     outputDir,
-    trackingFile,
+    port,
+    dbFile,
     url
   };
 }
 
-async function readTrackingRegistry(trackingFile: string): Promise<ScrapedUrlRegistry> {
-  const content = await readFile(trackingFile, "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  });
-
-  if (content === null) {
-    return {};
+function parsePositiveInteger(arg: string, flagName: string): number {
+  const value = Number(arg.slice(`${flagName}=`.length));
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid ${flagName} value: ${arg}`);
   }
-
-  const parsed = JSON.parse(content) as unknown;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`Invalid tracking file format: ${trackingFile}`);
-  }
-
-  return parsed as ScrapedUrlRegistry;
+  return value;
 }
 
-async function writeTrackingRegistry(trackingFile: string, registry: ScrapedUrlRegistry): Promise<void> {
-  await mkdir(path.dirname(trackingFile), { recursive: true });
-  await writeFile(trackingFile, `${JSON.stringify(registry, null, 2)}\n`, "utf8");
+async function scrapeUrls(inputUrls: string[], options: CliOptions): Promise<BatchScrapeSummary> {
+  const uniqueInputUrls = [...new Set(inputUrls.map((url) => url.trim()).filter(Boolean))];
+  const failed: BatchScrapeSummary["failed"] = [];
+  const saved: ScrapeResult[] = [];
+  const skipped: ScrapeResult[] = [];
+
+  for (const inputUrl of uniqueInputUrls) {
+    try {
+      const result = await scrapeSingleUrl(inputUrl, options);
+      if (result.status === "saved") {
+        saved.push(result);
+      } else {
+        skipped.push(result);
+      }
+    } catch (error) {
+      failed.push({
+        error: error instanceof Error ? error.message : String(error),
+        inputUrl
+      });
+    }
+  }
+
+  return {
+    failed,
+    saved,
+    skipped,
+    total: uniqueInputUrls.length
+  };
+}
+
+function printBatchSummary(summary: BatchScrapeSummary): void {
+  console.log(`Processed ${summary.total} URL(s): ${summary.saved.length} saved, ${summary.skipped.length} skipped, ${summary.failed.length} failed.`);
+
+  for (const result of summary.saved) {
+    console.log(`Saved: ${result.sourceUrl} -> ${result.outputPath}`);
+  }
+
+  for (const result of summary.skipped) {
+    console.log(`Skipped existing: ${result.sourceUrl} -> ${result.outputPath}`);
+  }
+
+  for (const failure of summary.failed) {
+    console.log(`Failed: ${failure.inputUrl}: ${failure.error}`);
+  }
+}
+
+async function scrapeSingleUrl(inputUrl: string, options: CliOptions): Promise<ScrapeResult> {
+  const outputDir = path.resolve(process.cwd(), options.outputDir);
+  const dbFile = path.resolve(process.cwd(), options.dbFile);
+
+  await mkdir(outputDir, { recursive: true });
+
+  const article = createSingleArticle(inputUrl);
+  const db = openTrackingDatabase(dbFile);
+  const existingRecord = getScrapedUrlRecord(db, article.sourceUrl);
+
+  if (existingRecord) {
+    db.close();
+    return {
+      outputPath: existingRecord.outputPath,
+      sourceUrl: article.sourceUrl,
+      status: "skipped"
+    };
+  }
+
+  const { browser, context } = await openBrowserSession(options.browser, options.headless, options.connectUrl);
+
+  try {
+    const result = await extractArticleContent(context, article, outputDir, 1);
+    const outputPath = await writeExtraction(outputDir, result, 1);
+    upsertScrapedUrlRecord(db, {
+      outputPath,
+      scrapedAt: new Date().toISOString(),
+      sourceUrl: article.sourceUrl
+    });
+
+    return {
+      outputPath,
+      sourceUrl: article.sourceUrl,
+      status: "saved"
+    };
+  } finally {
+    db.close();
+    await browser.close();
+  }
+}
+
+async function startUiServer(options: CliOptions): Promise<void> {
+  let lastMessage: string | null = null;
+  let isScraping = false;
+
+  const server = createServer(async (request, response) => {
+    try {
+      if (request.method === "GET" && request.url === "/") {
+        await renderHome(response, options, lastMessage, isScraping);
+        return;
+      }
+
+      if (request.method === "POST" && request.url === "/scrape") {
+        if (isScraping) {
+          redirect(response, "/");
+          return;
+        }
+
+        const body = await readRequestBody(request);
+        const inputUrls = parseUrlList(new URLSearchParams(body).get("urls") ?? "");
+        if (inputUrls.length === 0) {
+          lastMessage = "Missing article URL.";
+          redirect(response, "/");
+          return;
+        }
+
+        isScraping = true;
+        try {
+          const summary = await scrapeUrls(inputUrls, options);
+          lastMessage = `Processed ${summary.total} URL(s): ${summary.saved.length} saved, ${summary.skipped.length} skipped, ${summary.failed.length} failed.`;
+          if (summary.failed.length > 0) {
+            lastMessage += ` First error: ${summary.failed[0].inputUrl}: ${summary.failed[0].error}`;
+          }
+        } catch (error) {
+          lastMessage = error instanceof Error ? error.message : String(error);
+        } finally {
+          isScraping = false;
+        }
+
+        redirect(response, "/");
+        return;
+      }
+
+      if (request.method === "POST" && request.url === "/reset") {
+        resetTrackingDatabase(path.resolve(process.cwd(), options.dbFile));
+        lastMessage = "Tracking database reset.";
+        redirect(response, "/");
+        return;
+      }
+
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Not found");
+    } catch (error) {
+      response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end(error instanceof Error ? error.stack || error.message : String(error));
+    }
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(options.port, "127.0.0.1", resolve);
+  });
+  console.log(`UI running at http://127.0.0.1:${options.port}`);
+}
+
+function parseUrlList(value: string): string[] {
+  return value
+    .split(/[\n,]+/)
+    .map((url) => url.trim())
+    .filter(Boolean);
+}
+
+async function renderHome(
+  response: ServerResponse,
+  options: CliOptions,
+  message: string | null,
+  isScraping: boolean
+): Promise<void> {
+  const db = openTrackingDatabase(path.resolve(process.cwd(), options.dbFile));
+  const records = listScrapedUrlRecords(db);
+  db.close();
+  const rows = records.map((record) => {
+    return `<tr>
+      <td><a href="${escapeHtml(record.sourceUrl)}">${escapeHtml(record.sourceUrl)}</a></td>
+      <td>${escapeHtml(record.scrapedAt)}</td>
+      <td>${escapeHtml(record.outputPath)}</td>
+    </tr>`;
+  }).join("");
+
+  response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  response.end(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Web Scrapper</title>
+  <style>
+    :root { color-scheme: light; --bg: #f5efe6; --ink: #221f1b; --muted: #756b5f; --line: #d8cbbc; --accent: #0d5c63; --accent-2: #d9822b; }
+    body { margin: 0; background: radial-gradient(circle at top left, #fff7dd 0, transparent 32rem), var(--bg); color: var(--ink); font-family: Georgia, "Times New Roman", serif; }
+    main { width: min(1100px, calc(100% - 32px)); margin: 48px auto; }
+    h1 { font-size: clamp(2.5rem, 7vw, 5.5rem); line-height: .9; margin: 0 0 24px; letter-spacing: -0.06em; }
+    .panel { background: rgba(255,255,255,.72); border: 1px solid var(--line); border-radius: 22px; padding: 22px; box-shadow: 0 18px 50px rgba(74,48,25,.12); }
+    form { display: flex; gap: 12px; flex-wrap: wrap; }
+    textarea { flex: 1 1 100%; min-height: 145px; resize: vertical; border: 1px solid var(--line); border-radius: 20px; padding: 16px 18px; font: 15px ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.45; }
+    button { border: 0; border-radius: 999px; padding: 14px 20px; background: var(--accent); color: white; font-weight: 700; cursor: pointer; }
+    button.danger { background: #8f2d24; }
+    .message { margin: 16px 0 0; color: var(--accent); font-weight: 700; }
+    .meta { color: var(--muted); margin: 0 0 24px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 20px; font-size: 14px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 12px 8px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    a { color: var(--accent); overflow-wrap: anywhere; }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 28px 0 12px; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="meta">Freedium extraction UI · source URL registry · duplicate skip</p>
+    <h1>Article Scrapper</h1>
+    <section class="panel">
+      <form method="post" action="/scrape">
+        <textarea name="urls" placeholder="Paste one article URL, or many article URLs separated by new lines or commas." required></textarea>
+        <button type="submit" ${isScraping ? "disabled" : ""}>${isScraping ? "Scraping..." : "Scrape URL(s)"}</button>
+      </form>
+      ${message ? `<p class="message">${escapeHtml(message)}</p>` : ""}
+    </section>
+    <div class="toolbar">
+      <h2>Scraped Sources (${records.length})</h2>
+      <form method="post" action="/reset">
+        <button class="danger" type="submit">Reset Database</button>
+      </form>
+    </div>
+    <section class="panel">
+      <table>
+        <thead><tr><th>Source URL</th><th>Scraped At</th><th>Output</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="3">No scraped URLs yet.</td></tr>`}</tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>`);
+}
+
+async function readRequestBody(request: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function redirect(response: ServerResponse, location: string): void {
+  response.writeHead(303, { Location: location });
+  response.end();
+}
+
+function openTrackingDatabase(dbFile: string): DatabaseSync {
+  mkdirSyncLike(path.dirname(dbFile));
+  const db = new DatabaseSync(dbFile);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scraped_urls (
+      source_url TEXT PRIMARY KEY,
+      output_path TEXT NOT NULL,
+      scraped_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_scraped_urls_scraped_at ON scraped_urls(scraped_at);
+  `);
+  return db;
+}
+
+function mkdirSyncLike(dirPath: string): void {
+  mkdirSync(dirPath, { recursive: true });
+}
+
+function getScrapedUrlRecord(db: DatabaseSync, sourceUrl: string): ScrapedUrlRecord | null {
+  const row = db
+    .prepare("SELECT source_url AS sourceUrl, output_path AS outputPath, scraped_at AS scrapedAt FROM scraped_urls WHERE source_url = ?")
+    .get(sourceUrl) as ScrapedUrlRecord | undefined;
+
+  return row ?? null;
+}
+
+function listScrapedUrlRecords(db: DatabaseSync): ScrapedUrlRecord[] {
+  return db
+    .prepare("SELECT source_url AS sourceUrl, output_path AS outputPath, scraped_at AS scrapedAt FROM scraped_urls ORDER BY scraped_at DESC")
+    .all() as ScrapedUrlRecord[];
+}
+
+function upsertScrapedUrlRecord(db: DatabaseSync, record: ScrapedUrlRecord): void {
+  db
+    .prepare(`
+      INSERT INTO scraped_urls (source_url, output_path, scraped_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(source_url) DO UPDATE SET
+        output_path = excluded.output_path,
+        scraped_at = excluded.scraped_at
+    `)
+    .run(record.sourceUrl, record.outputPath, record.scrapedAt);
+}
+
+function resetTrackingDatabase(dbFile: string): void {
+  const db = openTrackingDatabase(dbFile);
+  db.exec("DELETE FROM scraped_urls;");
+  db.close();
 }
 
 function createSingleArticle(inputUrl: string): Article {
   const sourceUrl = normalizeArticleUrl(inputUrl);
   const title = deriveTitleFromUrl(sourceUrl);
   return { title, sourceUrl };
+}
+
+async function openBrowserSession(browserName: BrowserName, headless: boolean, connectUrl: string | null) {
+  const browser = connectUrl
+    ? await chromium.connectOverCDP(connectUrl)
+    : await launchBrowser(browserName, headless);
+
+  const existingContext = browser.contexts()[0];
+  const context = existingContext ?? await browser.newContext();
+
+  return { browser, context };
+}
+
+async function launchBrowser(browserName: BrowserName, headless: boolean) {
+  if (browserName === "chrome") {
+    return chromium.launch({ channel: "chrome", headless });
+  }
+
+  if (browserName === "msedge") {
+    return chromium.launch({ channel: "msedge", headless });
+  }
+
+  if (browserName === "firefox") {
+    return firefox.launch({ headless });
+  }
+
+  return webkit.launch({ headless });
 }
 
 async function extractArticleContent(
@@ -306,6 +658,15 @@ function normalizeText(value: string): string {
     .replace(/\r\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 main().catch((error: unknown) => {

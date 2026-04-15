@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "scrape": "node --enable-source-maps dist/apps/scraper/src/index.js",
+    "scrape": "node --enable-source-maps dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

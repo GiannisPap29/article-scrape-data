@@ -1,60 +1,103 @@
 # web-scrapper
 
-Monorepo for automating a content extraction flow:
+Single or pasted-list Medium extraction through Freedium.
 
-1. Open `https://freedium-mirror.cfd/`
-2. Submit a single article URL
-3. Extract the main content
-4. Save the result as a text file in `data/output/`
-5. Track scraped URLs in `data/scraped-urls.json` so duplicates are skipped
+Flow:
+
+1. Provide one Medium/Freedium article URL, or paste a list of article URLs in the UI.
+2. The scraper submits the source URL to `https://freedium-mirror.cfd/`.
+3. Extracted content is saved as a `.txt` file in `data/output/`.
+4. The normalized source URL is tracked in `data/scraped-urls.db`.
+5. Already-scraped source URLs are skipped.
 
 ## Workspace layout
 
-- `apps/scraper`: Playwright scraper application
+- `apps/scraper`: Playwright scraper and local UI
 - `packages/config`: Shared scraper configuration
-- `data/output`: Generated text output
+- `data/output`: Generated text/debug output
+- `data/scraped-urls.db`: SQLite source URL registry
 
 ## Setup
-
-```bash
-npm install
-npx playwright install chromium
-```
-
-Or with `make`:
 
 ```bash
 make install
 make browsers
 ```
 
-## Run
+## CLI
+
+Scrape one article:
 
 ```bash
-make scrape URL="https://freedium-mirror.cfd/https://medium.com/@kanishks772/postgresql-vs-duckdb-vs-exasol-the-benchmark-that-changed-my-stack-a4341ab6517e"
+make scrape URL="https://medium.com/@kanishks772/postgresql-vs-duckdb-vs-exasol-the-benchmark-that-changed-my-stack-a4341ab6517e"
 ```
 
-Optional flags:
+Run with a visible browser:
 
-- `--headless=false`
-- `--outputDir=./data/output`
-- `--trackingFile=./data/scraped-urls.json`
-- `--url=https://freedium-mirror.cfd/https://medium.com/...`
+```bash
+make scrape-headed URL="https://medium.com/@kanishks772/postgresql-vs-duckdb-vs-exasol-the-benchmark-that-changed-my-stack-a4341ab6517e"
+```
 
-Useful `make` targets:
+Reset the source URL registry:
 
-- `make help`
-- `make build`
-- `make typecheck`
-- `make scrape URL="https://freedium-mirror.cfd/https://medium.com/..."`
-- `make scrape-headed URL="https://freedium-mirror.cfd/https://medium.com/..."`
-- `make show-tracking`
-- `make reset-tracking`
-- `make clean-output`
+```bash
+make reset-db
+```
+
+Inspect the registry:
+
+```bash
+make show-db
+```
+
+## UI
+
+Start the local UI:
+
+```bash
+make ui
+```
+
+Open:
+
+```text
+http://127.0.0.1:3000
+```
+
+The UI lets you:
+
+- submit one article URL
+- paste a list of article URLs separated by new lines or commas
+- see already-scraped source URLs
+- skip duplicates automatically
+- reset the tracking database for fresh testing
+
+Use a visible browser for UI-triggered scrapes:
+
+```bash
+make ui-headed
+```
+
+Attach to an existing Chrome/Edge DevTools session:
+
+```bash
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/medium-debug
+make ui-headed CONNECT_URL="http://127.0.0.1:9222"
+```
+
+## Options
+
+- `BROWSER=chrome|msedge|firefox|webkit`
+- `CONNECT_URL=http://127.0.0.1:9222`
+- `OUTPUT_DIR=./data/output`
+- `DB_FILE=./data/scraped-urls.db`
+- `PORT=3000`
 
 ## Notes
 
-- The scraper uses browser automation because both sites are interaction-driven.
-- `--url` is required and accepts either a direct Freedium mirror URL or the original article URL.
-- Successfully scraped URLs are stored in `data/scraped-urls.json` and skipped on future runs.
-- If Medium or Freedium change their markup, selectors may need to be updated.
+- Freedium is used only for content extraction.
+- Medium list/page scanning has been removed from the main workflow.
+- Pasted URL lists are processed as static input; no pagination or Medium page scanning is performed.
+- Duplicate checks happen before browser extraction, using the normalized source URL.
+- SQLite table: `scraped_urls(source_url, output_path, scraped_at)`.
+- `make reset-db` clears only the SQLite tracking database, not existing output files.
