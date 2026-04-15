@@ -1,6 +1,5 @@
-.PHONY: help install browsers build typecheck scrape scrape-headed ui ui-headed reset-db show-db clean-output
+.PHONY: help install browsers build typecheck ui ui-headed reset-db show-db clean-output
 
-URL ?=
 OUTPUT_DIR ?= ./data/output
 DB_FILE ?= ./data/scraped-urls.db
 BROWSER ?= chrome
@@ -15,8 +14,6 @@ help:
 	'  make browsers                    Install Playwright browsers' \
 	'  make build                       Build all workspaces' \
 	'  make typecheck                   Run TypeScript checks' \
-	'  make scrape URL=...              Scrape one article URL through Freedium' \
-	'  make scrape-headed URL=...       Scrape one article URL with visible browser' \
 	'  make ui                          Start local web UI' \
 	'  make ui-headed                   Start local web UI with visible browser for scrapes' \
 	'  make show-db                     Print scraped source URL database rows' \
@@ -24,7 +21,6 @@ help:
 	'  make clean-output                Remove generated output files' \
 	'' \
 	'Variables:' \
-	'  URL=https://medium.com/...' \
 	'  OUTPUT_DIR=./data/output' \
 	'  DB_FILE=./data/scraped-urls.db' \
 	'  BROWSER=chrome|msedge|firefox|webkit' \
@@ -42,16 +38,6 @@ build:
 
 typecheck:
 	npm run typecheck
-
-scrape:
-	@if [ -z "$(URL)" ]; then \
-		echo 'Missing URL. Use: make scrape URL=https://medium.com/...'; \
-		exit 1; \
-	fi
-	npm run scrape -- --browser="$(BROWSER)" $(if $(CONNECT_URL),--connectUrl="$(CONNECT_URL)",) --url="$(URL)" --outputDir="$(OUTPUT_DIR)" --dbFile="$(DB_FILE)" $(if $(filter false,$(HEADLESS)),--headless=false,)
-
-scrape-headed:
-	@$(MAKE) scrape URL="$(URL)" OUTPUT_DIR="$(OUTPUT_DIR)" DB_FILE="$(DB_FILE)" BROWSER="$(BROWSER)" CONNECT_URL="$(CONNECT_URL)" HEADLESS=false
 
 ui:
 	npm run scrape -- --serve --browser="$(BROWSER)" $(if $(CONNECT_URL),--connectUrl="$(CONNECT_URL)",) --outputDir="$(OUTPUT_DIR)" --dbFile="$(DB_FILE)" --port="$(PORT)" $(if $(filter false,$(HEADLESS)),--headless=false,)

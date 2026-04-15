@@ -64,6 +64,18 @@ const SECURITY_VERIFICATION_PATTERNS = [
   "just a moment"
 ];
 
+const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
+  "about",
+  "jobs",
+  "jobs-at-medium",
+  "m",
+  "me",
+  "policy",
+  "search",
+  "tag",
+  "topics"
+]);
+
 async function main(): Promise<void> {
   const options = parseCliArgs(process.argv.slice(2));
 
@@ -244,6 +256,7 @@ async function scrapeSingleUrl(inputUrl: string, options: CliOptions): Promise<S
   await mkdir(outputDir, { recursive: true });
 
   const article = createSingleArticle(inputUrl);
+  assertArticleUrl(article.sourceUrl);
   const db = openTrackingDatabase(dbFile);
   const existingRecord = getScrapedUrlRecord(db, article.sourceUrl);
 
@@ -343,7 +356,7 @@ async function startUiServer(options: CliOptions): Promise<void> {
 
 function parseUrlList(value: string): string[] {
   return value
-    .split(/[\n,]+/)
+    .split(/[\s,]+/)
     .map((url) => url.trim())
     .filter(Boolean);
 }
@@ -397,7 +410,7 @@ async function renderHome(
     <h1>Article Scrapper</h1>
     <section class="panel">
       <form method="post" action="/scrape">
-        <textarea name="urls" placeholder="Paste one article URL, or many article URLs separated by new lines or commas." required></textarea>
+        <textarea name="urls" placeholder="Paste article URLs only, one per line. Do not paste Medium feed/profile/list URLs." required></textarea>
         <button type="submit" ${isScraping ? "disabled" : ""}>${isScraping ? "Scraping..." : "Scrape URL(s)"}</button>
       </form>
       ${message ? `<p class="message">${escapeHtml(message)}</p>` : ""}
@@ -486,6 +499,27 @@ function createSingleArticle(inputUrl: string): Article {
   const sourceUrl = normalizeArticleUrl(inputUrl);
   const title = deriveTitleFromUrl(sourceUrl);
   return { title, sourceUrl };
+}
+
+function assertArticleUrl(sourceUrl: string): void {
+  const parsed = new URL(sourceUrl);
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  const firstSegment = segments[0] ?? "";
+  const lastSegment = segments.at(-1) ?? "";
+
+  if (BLOCKED_MEDIUM_PATH_PREFIXES.has(firstSegment) || segments.includes("following-feed")) {
+    throw new Error(`Not an article URL: ${sourceUrl}`);
+  }
+
+  if (segments[0] === "p" && /^[a-f0-9]{8,}$/i.test(lastSegment)) {
+    return;
+  }
+
+  if (/^[a-z0-9-]+-[a-f0-9]{8,}$/i.test(lastSegment)) {
+    return;
+  }
+
+  throw new Error(`Not an article URL: ${sourceUrl}`);
 }
 
 async function openBrowserSession(browserName: BrowserName, headless: boolean, connectUrl: string | null) {

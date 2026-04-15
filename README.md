@@ -24,19 +24,7 @@ make install
 make browsers
 ```
 
-## CLI
-
-Scrape one article:
-
-```bash
-make scrape URL="https://medium.com/@kanishks772/postgresql-vs-duckdb-vs-exasol-the-benchmark-that-changed-my-stack-a4341ab6517e"
-```
-
-Run with a visible browser:
-
-```bash
-make scrape-headed URL="https://medium.com/@kanishks772/postgresql-vs-duckdb-vs-exasol-the-benchmark-that-changed-my-stack-a4341ab6517e"
-```
+## Commands
 
 Reset the source URL registry:
 
@@ -49,8 +37,6 @@ Inspect the registry:
 ```bash
 make show-db
 ```
-
-## UI
 
 Start the local UI:
 
@@ -68,6 +54,7 @@ The UI lets you:
 
 - submit one article URL
 - paste a list of article URLs separated by new lines or commas
+- reject Medium profile/feed/list URLs before extraction
 - see already-scraped source URLs
 - skip duplicates automatically
 - reset the tracking database for fresh testing
@@ -98,6 +85,7 @@ make ui-headed CONNECT_URL="http://127.0.0.1:9222"
 - Freedium is used only for content extraction.
 - Medium list/page scanning has been removed from the main workflow.
 - Pasted URL lists are processed as static input; no pagination or Medium page scanning is performed.
+- Pasted lists must contain article URLs, not Medium profile/feed/list URLs such as `/me/following-feed/...`.
 - Duplicate checks happen before browser extraction, using the normalized source URL.
 - SQLite table: `scraped_urls(source_url, output_path, scraped_at)`.
 - `make reset-db` clears only the SQLite tracking database, not existing output files.
