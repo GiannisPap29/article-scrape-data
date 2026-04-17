@@ -10,7 +10,7 @@
     "build": "npm run build --workspace @web-scrapper/config && npm run build --workspace @web-scrapper/scraper",
     "install:browsers": "npx playwright install chromium",
     "scrape": "npm run build && node --no-warnings --enable-source-maps apps/scraper/dist/index.js",
-    "typecheck": "npm run typecheck --workspace @web-scrapper/config && npm run typecheck --workspace @web-scrapper/scraper"
+    "typecheck": "npm run build --workspace @web-scrapper/config && npm run typecheck --workspace @web-scrapper/config && npm run typecheck --workspace @web-scrapper/scraper"
   },
   "devDependencies": {
     "@types/node": "^24.0.10",

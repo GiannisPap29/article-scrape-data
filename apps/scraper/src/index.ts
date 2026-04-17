@@ -1,33 +1,82 @@
-import { mkdirSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { type AddressInfo } from "node:net";
 import path from "node:path";
 import process from "node:process";
+import { setTimeout as delay } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { chromium, firefox, webkit, type BrowserContext, type Page } from "@playwright/test";
 import {
   DEFAULT_DB_FILE,
+  DEFAULT_GOOGLE_OAUTH_CLIENT_FILE,
+  DEFAULT_GOOGLE_OAUTH_TOKEN_FILE,
   DEFAULT_OUTPUT_DIR,
+  DEFAULT_POLL_INTERVAL_MINUTES,
+  GOOGLE_DRIVE_SCOPE,
   TARGET_URL
 } from "@web-scrapper/config";
 
 type BrowserName = "chrome" | "msedge" | "firefox" | "webkit";
-type Command = "scrape" | "serve" | "reset";
+type Command = "reset" | "scan-drive" | "watch-drive";
 
 type CliOptions = {
   browser: BrowserName;
   command: Command;
   connectUrl: string | null;
-  headless: boolean;
-  outputDir: string;
-  port: number;
   dbFile: string;
-  url: string | null;
+  driveFailedFolderId: string | null;
+  driveFolderId: string | null;
+  headless: boolean;
+  oauthClientFile: string;
+  oauthTokenFile: string;
+  outputDir: string;
+  pollIntervalMinutes: number;
 };
+
+type DriveWatcherOptions = {
+  dbFile: string;
+  driveFailedFolderId: string | null;
+  driveFolderId: string;
+  oauthClientFile: string;
+  oauthTokenFile: string;
+  outputDir: string;
+  pollIntervalMinutes: number;
+} & Pick<CliOptions, "browser" | "connectUrl" | "headless">;
 
 type Article = {
   title: string;
   sourceUrl: string;
+};
+
+type DriveDocumentFile = {
+  id: string;
+  mimeType?: string;
+  modifiedTime: string;
+  name: string;
+  parents?: string[];
+  webViewLink?: string;
+};
+
+type DriveFileParentsResponse = {
+  id: string;
+  name?: string;
+  parents?: string[];
+};
+
+type DriveListResponse = {
+  files?: DriveDocumentFile[];
+  nextPageToken?: string;
+};
+
+type DriveScanSummary = {
+  deleted: number;
+  failed: number;
+  movedToFailure: number;
+  saved: number;
+  skippedExisting: number;
+  totalDocs: number;
 };
 
 type ExtractionResult = {
@@ -36,17 +85,37 @@ type ExtractionResult = {
   footerContent: string | null;
 };
 
+type GoogleDocument = {
+  body?: {
+    content?: StructuralElement[];
+  };
+  title?: string;
+};
+
+type GoogleOAuthClient = {
+  authUri: string;
+  clientId: string;
+  clientSecret?: string;
+  tokenUri: string;
+};
+
+type GoogleOAuthToken = {
+  accessToken: string;
+  expiryDateMs?: number;
+  refreshToken?: string;
+  scope?: string;
+  tokenType?: string;
+};
+
+type OAuthCallbackResult = {
+  code: string;
+  redirectUri: string;
+};
+
 type ScrapeResult = {
   outputPath: string;
   sourceUrl: string;
   status: "saved" | "skipped";
-};
-
-type BatchScrapeSummary = {
-  failed: Array<{ error: string; inputUrl: string; }>;
-  saved: ScrapeResult[];
-  skipped: ScrapeResult[];
-  total: number;
 };
 
 type ScrapedUrlRecord = {
@@ -55,6 +124,36 @@ type ScrapedUrlRecord = {
   sourceUrl: string;
 };
 
+type StructuralElement = {
+  paragraph?: {
+    elements?: Array<{
+      autoText?: { content?: string; };
+      textRun?: { content?: string; };
+    }>;
+  };
+  table?: {
+    tableRows?: Array<{
+      tableCells?: Array<{
+        content?: StructuralElement[];
+      }>;
+    }>;
+  };
+  tableOfContents?: {
+    content?: StructuralElement[];
+  };
+};
+
+const GOOGLE_DRIVE_FILE_FIELDS = "files(id,name,mimeType,modifiedTime,parents,webViewLink),nextPageToken";
+const GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
+const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
+const GOOGLE_TEXT_MIME_TYPES = new Set([
+  "application/json",
+  "application/xml",
+  "text/csv",
+  "text/markdown",
+  "text/plain"
+]);
+const OAUTH_CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
 const SECURITY_VERIFICATION_PATTERNS = [
   "performing security verification",
   "verifies you are not a bot",
@@ -68,6 +167,8 @@ const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
   "about",
   "jobs",
   "jobs-at-medium",
+  "list",
+  "lists",
   "m",
   "me",
   "policy",
@@ -77,45 +178,85 @@ const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
 ]);
 
 async function main(): Promise<void> {
+  loadDotEnv(path.resolve(process.cwd(), ".env"));
   const options = parseCliArgs(process.argv.slice(2));
-
-  if (options.command === "serve") {
-    await startUiServer(options);
-    return;
-  }
+  logInfo(`Starting command=${options.command} browser=${options.browser} headless=${options.headless} outputDir=${options.outputDir} dbFile=${options.dbFile}`);
 
   if (options.command === "reset") {
     resetTrackingDatabase(path.resolve(process.cwd(), options.dbFile));
-    console.log(`Reset tracking database: ${path.resolve(process.cwd(), options.dbFile)}`);
+    logInfo(`Reset tracking database: ${path.resolve(process.cwd(), options.dbFile)}`);
     return;
   }
 
-  if (!options.url) {
-    throw new Error("Missing required --url value.");
+  if (options.command === "scan-drive") {
+    const summary = await scanDriveQueue(resolveDriveWatcherOptions(options));
+    logInfo(`Drive scan finished: totalDocs=${summary.totalDocs} saved=${summary.saved} skippedExisting=${summary.skippedExisting} movedToFailure=${summary.movedToFailure} deleted=${summary.deleted} failed=${summary.failed}`);
+    return;
   }
 
-  const summary = await scrapeUrls([options.url], options);
-  printBatchSummary(summary);
+  if (options.command === "watch-drive") {
+    await watchDriveQueue(resolveDriveWatcherOptions(options));
+    return;
+  }
+}
+
+function loadDotEnv(filePath: string): void {
+  if (!existsSync(filePath)) {
+    return;
+  }
+
+  const raw = readFileSync(filePath, "utf8");
+  for (const line of raw.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    if (!key || process.env[key] !== undefined) {
+      continue;
+    }
+
+    let value = trimmed.slice(separatorIndex + 1).trim();
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
+  }
 }
 
 function parseCliArgs(args: string[]): CliOptions {
   let browser: BrowserName = "chrome";
-  let command: Command = "scrape";
-  let connectUrl: string | null = null;
-  let headless = true;
-  let outputDir = DEFAULT_OUTPUT_DIR;
-  let port = 3000;
-  let dbFile = DEFAULT_DB_FILE;
-  let url: string | null = null;
+  let command: Command = "scan-drive";
+  let connectUrl: string | null = readEnv("CONNECT_URL");
+  let headless = readEnv("HEADLESS") !== "false";
+  let outputDir = readEnv("OUTPUT_DIR") ?? DEFAULT_OUTPUT_DIR;
+  let dbFile = readEnv("DB_FILE") ?? DEFAULT_DB_FILE;
+  let driveFolderId = readEnv("DRIVE_FOLDER_ID");
+  let driveFailedFolderId = readEnv("DRIVE_FAILED_FOLDER_ID");
+  let oauthClientFile = readEnv("GOOGLE_OAUTH_CLIENT_FILE") ?? DEFAULT_GOOGLE_OAUTH_CLIENT_FILE;
+  let oauthTokenFile = readEnv("GOOGLE_OAUTH_TOKEN_FILE") ?? DEFAULT_GOOGLE_OAUTH_TOKEN_FILE;
+  let pollIntervalMinutes = parsePositiveInteger(readEnv("POLL_INTERVAL_MINUTES"), "POLL_INTERVAL_MINUTES", DEFAULT_POLL_INTERVAL_MINUTES);
 
   for (const arg of args) {
-    if (arg === "--serve") {
-      command = "serve";
+    if (arg === "--reset") {
+      command = "reset";
       continue;
     }
 
-    if (arg === "--reset") {
-      command = "reset";
+    if (arg === "--scan-drive") {
+      command = "scan-drive";
+      continue;
+    }
+
+    if (arg === "--watch-drive") {
+      command = "watch-drive";
       continue;
     }
 
@@ -134,52 +275,47 @@ function parseCliArgs(args: string[]): CliOptions {
     }
 
     if (arg.startsWith("--connectUrl=")) {
-      const value = arg.slice("--connectUrl=".length).trim();
-      if (!value) {
-        throw new Error("Missing value for --connectUrl.");
-      }
-      connectUrl = value;
+      connectUrl = requiredFlagValue(arg, "--connectUrl");
       continue;
     }
 
     if (arg.startsWith("--outputDir=")) {
-      const value = arg.slice("--outputDir=".length).trim();
-      if (!value) {
-        throw new Error("Missing value for --outputDir.");
-      }
-      outputDir = value;
-      continue;
-    }
-
-    if (arg.startsWith("--port=")) {
-      port = parsePositiveInteger(arg, "--port");
+      outputDir = requiredFlagValue(arg, "--outputDir");
       continue;
     }
 
     if (arg.startsWith("--trackingFile=")) {
-      const value = arg.slice("--trackingFile=".length).trim();
-      if (!value) {
-        throw new Error("Missing value for --trackingFile.");
-      }
-      dbFile = value;
+      dbFile = requiredFlagValue(arg, "--trackingFile");
       continue;
     }
 
     if (arg.startsWith("--dbFile=")) {
-      const value = arg.slice("--dbFile=".length).trim();
-      if (!value) {
-        throw new Error("Missing value for --dbFile.");
-      }
-      dbFile = value;
+      dbFile = requiredFlagValue(arg, "--dbFile");
       continue;
     }
 
-    if (arg.startsWith("--url=")) {
-      const value = arg.slice("--url=".length).trim();
-      if (!value) {
-        throw new Error("Missing value for --url.");
-      }
-      url = value;
+    if (arg.startsWith("--driveFolderId=")) {
+      driveFolderId = requiredFlagValue(arg, "--driveFolderId");
+      continue;
+    }
+
+    if (arg.startsWith("--driveFailedFolderId=")) {
+      driveFailedFolderId = requiredFlagValue(arg, "--driveFailedFolderId");
+      continue;
+    }
+
+    if (arg.startsWith("--oauthClientFile=")) {
+      oauthClientFile = requiredFlagValue(arg, "--oauthClientFile");
+      continue;
+    }
+
+    if (arg.startsWith("--oauthTokenFile=")) {
+      oauthTokenFile = requiredFlagValue(arg, "--oauthTokenFile");
+      continue;
+    }
+
+    if (arg.startsWith("--pollIntervalMinutes=")) {
+      pollIntervalMinutes = parsePositiveInteger(requiredFlagValue(arg, "--pollIntervalMinutes"), "--pollIntervalMinutes");
     }
   }
 
@@ -187,69 +323,723 @@ function parseCliArgs(args: string[]): CliOptions {
     browser,
     command,
     connectUrl,
-    headless,
-    outputDir,
-    port,
     dbFile,
-    url
+    driveFailedFolderId,
+    driveFolderId,
+    headless,
+    oauthClientFile,
+    oauthTokenFile,
+    outputDir,
+    pollIntervalMinutes
   };
 }
 
-function parsePositiveInteger(arg: string, flagName: string): number {
-  const value = Number(arg.slice(`${flagName}=`.length));
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`Invalid ${flagName} value: ${arg}`);
+function requiredFlagValue(arg: string, flagName: string): string {
+  const value = arg.slice(`${flagName}=`.length).trim();
+  if (!value) {
+    throw new Error(`Missing value for ${flagName}.`);
   }
   return value;
 }
 
-async function scrapeUrls(inputUrls: string[], options: CliOptions): Promise<BatchScrapeSummary> {
-  const uniqueInputUrls = [...new Set(inputUrls.map((url) => url.trim()).filter(Boolean))];
-  const failed: BatchScrapeSummary["failed"] = [];
-  const saved: ScrapeResult[] = [];
-  const skipped: ScrapeResult[] = [];
-
-  for (const inputUrl of uniqueInputUrls) {
-    try {
-      const result = await scrapeSingleUrl(inputUrl, options);
-      if (result.status === "saved") {
-        saved.push(result);
-      } else {
-        skipped.push(result);
-      }
-    } catch (error) {
-      failed.push({
-        error: error instanceof Error ? error.message : String(error),
-        inputUrl
-      });
+function parsePositiveInteger(value: string | null, label: string, fallback?: number): number {
+  if (value === null || value === "") {
+    if (fallback !== undefined) {
+      return fallback;
     }
+
+    throw new Error(`Missing value for ${label}.`);
+  }
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid ${label} value: ${value}`);
+  }
+
+  return parsed;
+}
+
+function readEnv(name: string): string | null {
+  const value = process.env[name]?.trim();
+  return value ? value : null;
+}
+
+function resolveDriveWatcherOptions(options: CliOptions): DriveWatcherOptions {
+  if (!options.driveFolderId) {
+    throw new Error("Missing DRIVE_FOLDER_ID or --driveFolderId for Drive watcher commands.");
   }
 
   return {
-    failed,
-    saved,
-    skipped,
-    total: uniqueInputUrls.length
+    browser: options.browser,
+    connectUrl: options.connectUrl,
+    dbFile: options.dbFile,
+    driveFailedFolderId: options.driveFailedFolderId,
+    driveFolderId: options.driveFolderId,
+    headless: options.headless,
+    oauthClientFile: options.oauthClientFile,
+    oauthTokenFile: options.oauthTokenFile,
+    outputDir: options.outputDir,
+    pollIntervalMinutes: options.pollIntervalMinutes
   };
 }
 
-function printBatchSummary(summary: BatchScrapeSummary): void {
-  console.log(`Processed ${summary.total} URL(s): ${summary.saved.length} saved, ${summary.skipped.length} skipped, ${summary.failed.length} failed.`);
+async function watchDriveQueue(options: DriveWatcherOptions): Promise<void> {
+  const pollMs = options.pollIntervalMinutes * 60 * 1000;
+  logInfo(`Watching Google Drive folder ${options.driveFolderId} every ${options.pollIntervalMinutes} minute(s).`);
 
-  for (const result of summary.saved) {
-    console.log(`Saved: ${result.sourceUrl} -> ${result.outputPath}`);
-  }
+  for (;;) {
+    try {
+      const summary = await scanDriveQueue(options);
+      logInfo(`Watch cycle complete: totalDocs=${summary.totalDocs} saved=${summary.saved} skippedExisting=${summary.skippedExisting} movedToFailure=${summary.movedToFailure} deleted=${summary.deleted} failed=${summary.failed}`);
+    } catch (error) {
+      logError(`Watch cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
-  for (const result of summary.skipped) {
-    console.log(`Skipped existing: ${result.sourceUrl} -> ${result.outputPath}`);
-  }
-
-  for (const failure of summary.failed) {
-    console.log(`Failed: ${failure.inputUrl}: ${failure.error}`);
+    logInfo(`Sleeping for ${options.pollIntervalMinutes} minute(s) before next Drive scan.`);
+    await delay(pollMs);
   }
 }
 
-async function scrapeSingleUrl(inputUrl: string, options: CliOptions): Promise<ScrapeResult> {
+async function scanDriveQueue(options: DriveWatcherOptions): Promise<DriveScanSummary> {
+  const dbFile = path.resolve(process.cwd(), options.dbFile);
+  const outputDir = path.resolve(process.cwd(), options.outputDir);
+  const oauthClientFile = path.resolve(process.cwd(), options.oauthClientFile);
+  const oauthTokenFile = path.resolve(process.cwd(), options.oauthTokenFile);
+
+  await mkdir(outputDir, { recursive: true });
+
+  logInfo(`Drive scan start: folderId=${options.driveFolderId}`);
+  const session = await getGoogleAccessSession(oauthClientFile, oauthTokenFile);
+  const failureFolderId = await resolveFailureFolderId(session, options.driveFolderId, options.driveFailedFolderId);
+
+  if (failureFolderId === options.driveFolderId) {
+    throw new Error("Drive failure folder must be different from DRIVE_FOLDER_ID.");
+  }
+
+  const docs = await listSupportedDriveFilesInFolder(session, options.driveFolderId);
+  if (docs.length === 0) {
+    logInfo("Drive scan found no supported files to process.");
+    return {
+      deleted: 0,
+      failed: 0,
+      movedToFailure: 0,
+      saved: 0,
+      skippedExisting: 0,
+      totalDocs: 0
+    };
+  }
+
+  logInfo(`Drive scan found ${docs.length} supported file(s).`);
+  const summary: DriveScanSummary = {
+    deleted: 0,
+    failed: 0,
+    movedToFailure: 0,
+    saved: 0,
+    skippedExisting: 0,
+    totalDocs: docs.length
+  };
+
+  for (const [index, doc] of docs.entries()) {
+    logInfo(`Drive file start: ${doc.name} (${doc.id}) mimeType=${doc.mimeType ?? "unknown"}`);
+
+    try {
+      const text = await getDriveFileText(session, doc);
+      const sourceUrl = extractSingleArticleUrlFromText(text);
+      logInfo(`Drive file URL extracted: ${doc.name} (${doc.id}) -> ${sourceUrl}`);
+
+      const scrapeResult = await scrapeSingleUrl(sourceUrl, options, index + 1);
+      if (scrapeResult.status === "skipped") {
+        await deleteDriveFile(session, doc.id);
+        summary.deleted += 1;
+        summary.skippedExisting += 1;
+        logInfo(`Drive file deleted after DB match: ${doc.name} (${doc.id})`);
+        continue;
+      }
+
+      await deleteDriveFile(session, doc.id);
+      summary.deleted += 1;
+      summary.saved += 1;
+      logInfo(`Drive file deleted after successful scrape: ${doc.name} (${doc.id})`);
+    } catch (error) {
+      summary.failed += 1;
+      try {
+        await moveDriveFileToFolder(session, doc.id, failureFolderId);
+        summary.movedToFailure += 1;
+        logWarn(`Drive file moved to failure folder: ${doc.name} (${doc.id})`);
+      } catch (moveError) {
+        logError(`Failed to move Drive file to failure folder: ${doc.name} (${doc.id}): ${moveError instanceof Error ? moveError.message : String(moveError)}`);
+      }
+
+      logError(`Drive file processing failed: ${doc.name} (${doc.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return summary;
+}
+
+async function getGoogleAccessSession(clientFile: string, tokenFile: string): Promise<GoogleOAuthToken> {
+  const client = await readGoogleOAuthClient(clientFile);
+  const existingToken = await readGoogleOAuthToken(tokenFile);
+  if (existingToken && isAccessTokenValid(existingToken)) {
+    return existingToken;
+  }
+
+  if (existingToken?.refreshToken) {
+    const refreshedToken = await refreshGoogleAccessToken(client, existingToken, tokenFile);
+    return refreshedToken;
+  }
+
+  return authorizeGoogleAccess(client, tokenFile);
+}
+
+async function readGoogleOAuthClient(clientFile: string): Promise<GoogleOAuthClient> {
+  let raw: string;
+
+  try {
+    raw = await readFile(clientFile, "utf8");
+  } catch {
+    throw new Error(`Google OAuth client file not found: ${clientFile}`);
+  }
+
+  const parsed = JSON.parse(raw) as {
+    installed?: {
+      auth_uri?: string;
+      client_id?: string;
+      client_secret?: string;
+      redirect_uris?: string[];
+      token_uri?: string;
+    };
+    web?: {
+      auth_uri?: string;
+      client_id?: string;
+      client_secret?: string;
+      redirect_uris?: string[];
+      token_uri?: string;
+    };
+  };
+
+  const source = parsed.installed ?? parsed.web;
+  if (!source?.client_id || !source.auth_uri || !source.token_uri) {
+    throw new Error(`Invalid Google OAuth client file: ${clientFile}`);
+  }
+
+  return {
+    authUri: source.auth_uri,
+    clientId: source.client_id,
+    clientSecret: source.client_secret,
+    tokenUri: source.token_uri
+  };
+}
+
+async function readGoogleOAuthToken(tokenFile: string): Promise<GoogleOAuthToken | null> {
+  try {
+    const raw = await readFile(tokenFile, "utf8");
+    const parsed = JSON.parse(raw) as {
+      access_token?: string;
+      expiry_date_ms?: number;
+      refresh_token?: string;
+      scope?: string;
+      token_type?: string;
+    };
+
+    if (!parsed.access_token) {
+      return null;
+    }
+
+    return {
+      accessToken: parsed.access_token,
+      expiryDateMs: parsed.expiry_date_ms,
+      refreshToken: parsed.refresh_token,
+      scope: parsed.scope,
+      tokenType: parsed.token_type
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isAccessTokenValid(token: GoogleOAuthToken): boolean {
+  return Boolean(token.accessToken && token.expiryDateMs && token.expiryDateMs > Date.now() + 60_000);
+}
+
+async function refreshGoogleAccessToken(
+  client: GoogleOAuthClient,
+  existingToken: GoogleOAuthToken,
+  tokenFile: string
+): Promise<GoogleOAuthToken> {
+  if (!existingToken.refreshToken) {
+    throw new Error("Google OAuth token file does not contain a refresh token.");
+  }
+
+  logInfo("Refreshing Google OAuth access token.");
+  const params = new URLSearchParams({
+    client_id: client.clientId,
+    grant_type: "refresh_token",
+    refresh_token: existingToken.refreshToken
+  });
+
+  if (client.clientSecret) {
+    params.set("client_secret", client.clientSecret);
+  }
+
+  const response = await fetch(client.tokenUri, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: params
+  });
+
+  const payload = await parseJsonResponse<{
+    access_token?: string;
+    expires_in?: number;
+    refresh_token?: string;
+    scope?: string;
+    token_type?: string;
+    error?: string;
+    error_description?: string;
+  }>(response);
+
+  if (!response.ok || !payload.access_token || !payload.expires_in) {
+    throw new Error(`Failed to refresh Google OAuth token: ${payload.error_description ?? payload.error ?? response.statusText}`);
+  }
+
+  const refreshedToken: GoogleOAuthToken = {
+    accessToken: payload.access_token,
+    expiryDateMs: Date.now() + payload.expires_in * 1000,
+    refreshToken: payload.refresh_token ?? existingToken.refreshToken,
+    scope: payload.scope ?? existingToken.scope,
+    tokenType: payload.token_type ?? existingToken.tokenType ?? "Bearer"
+  };
+
+  await writeGoogleOAuthToken(tokenFile, refreshedToken);
+  return refreshedToken;
+}
+
+async function authorizeGoogleAccess(client: GoogleOAuthClient, tokenFile: string): Promise<GoogleOAuthToken> {
+  const callback = await waitForGoogleAuthorizationCode(client);
+  const params = new URLSearchParams({
+    client_id: client.clientId,
+    code: callback.code,
+    code_verifier: callback.codeVerifier,
+    grant_type: "authorization_code",
+    redirect_uri: callback.redirectUri
+  });
+
+  if (client.clientSecret) {
+    params.set("client_secret", client.clientSecret);
+  }
+
+  const response = await fetch(client.tokenUri, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: params
+  });
+
+  const payload = await parseJsonResponse<{
+    access_token?: string;
+    expires_in?: number;
+    refresh_token?: string;
+    scope?: string;
+    token_type?: string;
+    error?: string;
+    error_description?: string;
+  }>(response);
+
+  if (!response.ok || !payload.access_token || !payload.expires_in) {
+    throw new Error(`Failed to exchange Google OAuth authorization code: ${payload.error_description ?? payload.error ?? response.statusText}`);
+  }
+
+  const token: GoogleOAuthToken = {
+    accessToken: payload.access_token,
+    expiryDateMs: Date.now() + payload.expires_in * 1000,
+    refreshToken: payload.refresh_token,
+    scope: payload.scope,
+    tokenType: payload.token_type ?? "Bearer"
+  };
+
+  if (!token.refreshToken) {
+    logWarn("Google OAuth did not return a refresh token. Future runs may require re-authorization.");
+  }
+
+  await writeGoogleOAuthToken(tokenFile, token);
+  return token;
+}
+
+async function waitForGoogleAuthorizationCode(
+  client: GoogleOAuthClient
+): Promise<OAuthCallbackResult & { codeVerifier: string; }> {
+  const state = base64UrlEncode(randomBytes(32));
+  const codeVerifier = base64UrlEncode(randomBytes(64));
+  const codeChallenge = base64UrlEncode(createHash("sha256").update(codeVerifier).digest());
+
+  const server = createServer();
+  const redirectHost = "127.0.0.1";
+  const redirectPath = "/oauth2/callback";
+  let resolveCallback: ((value: OAuthCallbackResult) => void) | null = null;
+  let rejectCallback: ((reason?: unknown) => void) | null = null;
+
+  const callbackPromise = new Promise<OAuthCallbackResult>((resolve, reject) => {
+    resolveCallback = resolve;
+    rejectCallback = reject;
+  });
+
+  server.on("request", (request, response) => {
+    const requestUrl = new URL(request.url ?? "/", `http://${redirectHost}`);
+    if (requestUrl.pathname !== redirectPath) {
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Not found");
+      return;
+    }
+
+    if (requestUrl.searchParams.get("state") !== state) {
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Invalid OAuth state.");
+      rejectCallback?.(new Error("Google OAuth state mismatch."));
+      return;
+    }
+
+    const error = requestUrl.searchParams.get("error");
+    if (error) {
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end(`Google OAuth failed: ${error}`);
+      rejectCallback?.(new Error(`Google OAuth authorization failed: ${error}`));
+      return;
+    }
+
+    const code = requestUrl.searchParams.get("code");
+    if (!code) {
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Missing authorization code.");
+      rejectCallback?.(new Error("Google OAuth callback did not include an authorization code."));
+      return;
+    }
+
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    response.end("<html><body><h1>Authorization received</h1><p>You can close this browser tab and return to the scraper.</p></body></html>");
+    resolveCallback?.({
+      code,
+      redirectUri: `http://${redirectHost}:${(server.address() as AddressInfo).port}${redirectPath}`
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, redirectHost, resolve);
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Failed to start local Google OAuth callback listener.");
+  }
+
+  const redirectUri = `http://${redirectHost}:${address.port}${redirectPath}`;
+  const authUrl = new URL(client.authUri);
+  authUrl.searchParams.set("access_type", "offline");
+  authUrl.searchParams.set("client_id", client.clientId);
+  authUrl.searchParams.set("code_challenge", codeChallenge);
+  authUrl.searchParams.set("code_challenge_method", "S256");
+  authUrl.searchParams.set("prompt", "consent");
+  authUrl.searchParams.set("redirect_uri", redirectUri);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("scope", GOOGLE_DRIVE_SCOPE);
+  authUrl.searchParams.set("state", state);
+
+  logInfo("Google OAuth authorization required.");
+  logInfo(`Open this URL in your browser, sign in, and approve access:\n${authUrl.toString()}`);
+
+  const callbackResult = await Promise.race([
+    callbackPromise,
+    delay(OAUTH_CALLBACK_TIMEOUT_MS).then(() => {
+      throw new Error("Timed out waiting for Google OAuth authorization callback.");
+    })
+  ]).finally(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve();
+      });
+    }).catch(() => undefined);
+  });
+
+  return {
+    ...callbackResult,
+    codeVerifier
+  };
+}
+
+async function writeGoogleOAuthToken(tokenFile: string, token: GoogleOAuthToken): Promise<void> {
+  mkdirSync(path.dirname(tokenFile), { recursive: true });
+  await writeFile(tokenFile, JSON.stringify({
+    access_token: token.accessToken,
+    expiry_date_ms: token.expiryDateMs,
+    refresh_token: token.refreshToken,
+    scope: token.scope,
+    token_type: token.tokenType
+  }, null, 2), "utf8");
+}
+
+async function listSupportedDriveFilesInFolder(session: GoogleOAuthToken, folderId: string): Promise<DriveDocumentFile[]> {
+  const docs: DriveDocumentFile[] = [];
+  let pageToken: string | null = null;
+
+  do {
+    const url = new URL("https://www.googleapis.com/drive/v3/files");
+    url.searchParams.set("fields", GOOGLE_DRIVE_FILE_FIELDS);
+    url.searchParams.set("includeItemsFromAllDrives", "true");
+    url.searchParams.set("orderBy", "modifiedTime");
+    url.searchParams.set("pageSize", "100");
+    url.searchParams.set("q", `'${folderId}' in parents and trashed=false and (mimeType='${GOOGLE_DOC_MIME_TYPE}' or mimeType='text/plain' or mimeType='text/markdown' or mimeType='text/csv' or mimeType='application/json' or mimeType='application/xml')`);
+    url.searchParams.set("supportsAllDrives", "true");
+
+    if (pageToken) {
+      url.searchParams.set("pageToken", pageToken);
+    }
+
+    const response = await googleApiRequest<DriveListResponse>(session, url);
+    docs.push(...(response.files ?? []));
+    pageToken = response.nextPageToken ?? null;
+  } while (pageToken);
+
+  return docs;
+}
+
+async function getGoogleDocument(session: GoogleOAuthToken, documentId: string): Promise<GoogleDocument> {
+  const url = new URL(`https://docs.googleapis.com/v1/documents/${encodeURIComponent(documentId)}`);
+  return googleApiRequest<GoogleDocument>(session, url);
+}
+
+async function getDriveFileText(session: GoogleOAuthToken, file: DriveDocumentFile): Promise<string> {
+  if (file.mimeType === GOOGLE_DOC_MIME_TYPE) {
+    const document = await getGoogleDocument(session, file.id);
+    return extractTextFromGoogleDocument(document);
+  }
+
+  if (file.mimeType && GOOGLE_TEXT_MIME_TYPES.has(file.mimeType)) {
+    return downloadDriveTextFile(session, file.id);
+  }
+
+  throw new Error(`Unsupported Drive file type: ${file.mimeType ?? "unknown"}`);
+}
+
+async function downloadDriveTextFile(session: GoogleOAuthToken, fileId: string): Promise<string> {
+  const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
+  url.searchParams.set("alt", "media");
+  url.searchParams.set("supportsAllDrives", "true");
+
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      Accept: "text/plain, text/markdown, application/json, application/xml, text/csv;q=0.9, */*;q=0.1"
+    }
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Failed to download Drive text file (${response.status}): ${text || response.statusText}`);
+  }
+
+  return normalizeText(text);
+}
+
+function extractTextFromGoogleDocument(document: GoogleDocument): string {
+  return normalizeText(extractStructuralElements(document.body?.content ?? []));
+}
+
+function extractStructuralElements(elements: StructuralElement[]): string {
+  const parts: string[] = [];
+
+  for (const element of elements) {
+    if (element.paragraph?.elements) {
+      const paragraphText = element.paragraph.elements
+        .map((paragraphElement) => paragraphElement.textRun?.content ?? paragraphElement.autoText?.content ?? "")
+        .join("");
+      parts.push(paragraphText);
+    }
+
+    if (element.table?.tableRows) {
+      for (const row of element.table.tableRows) {
+        for (const cell of row.tableCells ?? []) {
+          parts.push(extractStructuralElements(cell.content ?? []));
+        }
+      }
+    }
+
+    if (element.tableOfContents?.content) {
+      parts.push(extractStructuralElements(element.tableOfContents.content));
+    }
+  }
+
+  return parts.join("\n");
+}
+
+function extractSingleArticleUrlFromText(text: string): string {
+  const candidates = [...text.matchAll(/https?:\/\/[^\s<>"'()]+/g)]
+    .map((match) => trimTrailingUrlPunctuation(match[0]));
+
+  const articleUrls = [...new Set(candidates.flatMap((candidate) => {
+    try {
+      const article = createSingleArticle(candidate);
+      assertArticleUrl(article.sourceUrl);
+      return [article.sourceUrl];
+    } catch {
+      return [];
+    }
+  }))];
+
+  if (articleUrls.length === 0) {
+    throw new Error("No valid Medium article URL found in Drive file.");
+  }
+
+  if (articleUrls.length > 1) {
+    throw new Error(`Drive file contains multiple Medium article URLs: ${articleUrls.join(", ")}`);
+  }
+
+  return articleUrls[0];
+}
+
+function trimTrailingUrlPunctuation(value: string): string {
+  return value.replace(/[.,;:!?]+$/g, "");
+}
+
+async function resolveFailureFolderId(
+  session: GoogleOAuthToken,
+  watchedFolderId: string,
+  configuredFailureFolderId: string | null
+): Promise<string> {
+  if (configuredFailureFolderId) {
+    return configuredFailureFolderId;
+  }
+
+  const watchedFolder = await getDriveFileParents(session, watchedFolderId);
+  const parentId = watchedFolder.parents?.[0] ?? "root";
+  const folderName = `${watchedFolder.name ?? "MEDIUM"}_FAILED`;
+  const existingFolderId = await findFolderIdByName(session, folderName, parentId);
+
+  if (existingFolderId) {
+    return existingFolderId;
+  }
+
+  return createDriveFolder(session, folderName, parentId);
+}
+
+async function getDriveFileParents(session: GoogleOAuthToken, fileId: string): Promise<DriveFileParentsResponse> {
+  const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
+  url.searchParams.set("fields", "id,name,parents");
+  url.searchParams.set("supportsAllDrives", "true");
+  return googleApiRequest<DriveFileParentsResponse>(session, url);
+}
+
+async function findFolderIdByName(session: GoogleOAuthToken, folderName: string, parentId: string): Promise<string | null> {
+  const url = new URL("https://www.googleapis.com/drive/v3/files");
+  url.searchParams.set("fields", "files(id)");
+  url.searchParams.set("includeItemsFromAllDrives", "true");
+  url.searchParams.set("pageSize", "1");
+  url.searchParams.set("q", `'${parentId}' in parents and name='${escapeDriveQueryValue(folderName)}' and mimeType='${GOOGLE_FOLDER_MIME_TYPE}' and trashed=false`);
+  url.searchParams.set("supportsAllDrives", "true");
+
+  const response = await googleApiRequest<{ files?: Array<{ id: string; }>; }>(session, url);
+  return response.files?.[0]?.id ?? null;
+}
+
+function escapeDriveQueryValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+async function createDriveFolder(session: GoogleOAuthToken, name: string, parentId: string): Promise<string> {
+  logInfo(`Creating Drive failure folder "${name}" under parent ${parentId}.`);
+  const response = await googleApiRequest<{ id: string; }>(
+    session,
+    new URL("https://www.googleapis.com/drive/v3/files?supportsAllDrives=true"),
+    {
+      method: "POST",
+      body: JSON.stringify({
+        mimeType: GOOGLE_FOLDER_MIME_TYPE,
+        name,
+        parents: [parentId]
+      }),
+      headers: {
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  return response.id;
+}
+
+async function deleteDriveFile(session: GoogleOAuthToken, fileId: string): Promise<void> {
+  const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
+  url.searchParams.set("supportsAllDrives", "true");
+  await googleApiRequest(session, url, { method: "DELETE" });
+}
+
+async function moveDriveFileToFolder(session: GoogleOAuthToken, fileId: string, folderId: string): Promise<void> {
+  const file = await getDriveFileParents(session, fileId);
+  const currentParents = (file.parents ?? []).join(",");
+  const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
+  url.searchParams.set("addParents", folderId);
+  if (currentParents) {
+    url.searchParams.set("removeParents", currentParents);
+  }
+  url.searchParams.set("fields", "id,parents");
+  url.searchParams.set("supportsAllDrives", "true");
+
+  await googleApiRequest(session, url, {
+    method: "PATCH",
+    body: JSON.stringify({}),
+    headers: {
+      "Content-Type": "application/json"
+    }
+  });
+}
+
+async function googleApiRequest<T = void>(
+  session: GoogleOAuthToken,
+  url: URL,
+  init: RequestInit = {}
+): Promise<T> {
+  const headers = new Headers(init.headers);
+  headers.set("Authorization", `Bearer ${session.accessToken}`);
+  if (!headers.has("Accept")) {
+    headers.set("Accept", "application/json");
+  }
+
+  const response = await fetch(url, {
+    ...init,
+    headers
+  });
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  const payload = await parseJsonResponse<T & { error?: { message?: string; }; }>(response);
+  if (!response.ok) {
+    const message = payload && typeof payload === "object" && "error" in payload
+      ? payload.error?.message
+      : response.statusText;
+    throw new Error(`Google API request failed (${response.status}): ${message ?? "Unknown error"}`);
+  }
+
+  return payload;
+}
+
+async function parseJsonResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  return text ? JSON.parse(text) as T : {} as T;
+}
+
+async function scrapeSingleUrl(
+  inputUrl: string,
+  options: Pick<CliOptions, "browser" | "connectUrl" | "dbFile" | "headless" | "outputDir">,
+  index = 1
+): Promise<ScrapeResult> {
   const outputDir = path.resolve(process.cwd(), options.outputDir);
   const dbFile = path.resolve(process.cwd(), options.dbFile);
 
@@ -257,6 +1047,7 @@ async function scrapeSingleUrl(inputUrl: string, options: CliOptions): Promise<S
 
   const article = createSingleArticle(inputUrl);
   assertArticleUrl(article.sourceUrl);
+  logInfo(`Normalized article URL: ${inputUrl} -> ${article.sourceUrl}`);
   const db = openTrackingDatabase(dbFile);
   const existingRecord = getScrapedUrlRecord(db, article.sourceUrl);
 
@@ -269,11 +1060,12 @@ async function scrapeSingleUrl(inputUrl: string, options: CliOptions): Promise<S
     };
   }
 
+  logInfo(`Opening browser for article: ${article.sourceUrl}`);
   const { browser, context } = await openBrowserSession(options.browser, options.headless, options.connectUrl);
 
   try {
-    const result = await extractArticleContent(context, article, outputDir, 1);
-    const outputPath = await writeExtraction(outputDir, result, 1);
+    const result = await extractArticleContent(context, article, outputDir, index);
+    const outputPath = await writeExtraction(outputDir, result, index);
     upsertScrapedUrlRecord(db, {
       outputPath,
       scrapedAt: new Date().toISOString(),
@@ -289,160 +1081,6 @@ async function scrapeSingleUrl(inputUrl: string, options: CliOptions): Promise<S
     db.close();
     await browser.close();
   }
-}
-
-async function startUiServer(options: CliOptions): Promise<void> {
-  let lastMessage: string | null = null;
-  let isScraping = false;
-
-  const server = createServer(async (request, response) => {
-    try {
-      if (request.method === "GET" && request.url === "/") {
-        await renderHome(response, options, lastMessage, isScraping);
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/scrape") {
-        if (isScraping) {
-          redirect(response, "/");
-          return;
-        }
-
-        const body = await readRequestBody(request);
-        const inputUrls = parseUrlList(new URLSearchParams(body).get("urls") ?? "");
-        if (inputUrls.length === 0) {
-          lastMessage = "Missing article URL.";
-          redirect(response, "/");
-          return;
-        }
-
-        isScraping = true;
-        try {
-          const summary = await scrapeUrls(inputUrls, options);
-          lastMessage = `Processed ${summary.total} URL(s): ${summary.saved.length} saved, ${summary.skipped.length} skipped, ${summary.failed.length} failed.`;
-          if (summary.failed.length > 0) {
-            lastMessage += ` First error: ${summary.failed[0].inputUrl}: ${summary.failed[0].error}`;
-          }
-        } catch (error) {
-          lastMessage = error instanceof Error ? error.message : String(error);
-        } finally {
-          isScraping = false;
-        }
-
-        redirect(response, "/");
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/reset") {
-        resetTrackingDatabase(path.resolve(process.cwd(), options.dbFile));
-        lastMessage = "Tracking database reset.";
-        redirect(response, "/");
-        return;
-      }
-
-      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      response.end("Not found");
-    } catch (error) {
-      response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
-      response.end(error instanceof Error ? error.stack || error.message : String(error));
-    }
-  });
-
-  await new Promise<void>((resolve) => {
-    server.listen(options.port, "127.0.0.1", resolve);
-  });
-  console.log(`UI running at http://127.0.0.1:${options.port}`);
-}
-
-function parseUrlList(value: string): string[] {
-  return value
-    .split(/[\s,]+/)
-    .map((url) => url.trim())
-    .filter(Boolean);
-}
-
-async function renderHome(
-  response: ServerResponse,
-  options: CliOptions,
-  message: string | null,
-  isScraping: boolean
-): Promise<void> {
-  const db = openTrackingDatabase(path.resolve(process.cwd(), options.dbFile));
-  const records = listScrapedUrlRecords(db);
-  db.close();
-  const rows = records.map((record) => {
-    return `<tr>
-      <td><a href="${escapeHtml(record.sourceUrl)}">${escapeHtml(record.sourceUrl)}</a></td>
-      <td>${escapeHtml(record.scrapedAt)}</td>
-      <td>${escapeHtml(record.outputPath)}</td>
-    </tr>`;
-  }).join("");
-
-  response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-  response.end(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Web Scrapper</title>
-  <style>
-    :root { color-scheme: light; --bg: #f5efe6; --ink: #221f1b; --muted: #756b5f; --line: #d8cbbc; --accent: #0d5c63; --accent-2: #d9822b; }
-    body { margin: 0; background: radial-gradient(circle at top left, #fff7dd 0, transparent 32rem), var(--bg); color: var(--ink); font-family: Georgia, "Times New Roman", serif; }
-    main { width: min(1100px, calc(100% - 32px)); margin: 48px auto; }
-    h1 { font-size: clamp(2.5rem, 7vw, 5.5rem); line-height: .9; margin: 0 0 24px; letter-spacing: -0.06em; }
-    .panel { background: rgba(255,255,255,.72); border: 1px solid var(--line); border-radius: 22px; padding: 22px; box-shadow: 0 18px 50px rgba(74,48,25,.12); }
-    form { display: flex; gap: 12px; flex-wrap: wrap; }
-    textarea { flex: 1 1 100%; min-height: 145px; resize: vertical; border: 1px solid var(--line); border-radius: 20px; padding: 16px 18px; font: 15px ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.45; }
-    button { border: 0; border-radius: 999px; padding: 14px 20px; background: var(--accent); color: white; font-weight: 700; cursor: pointer; }
-    button.danger { background: #8f2d24; }
-    .message { margin: 16px 0 0; color: var(--accent); font-weight: 700; }
-    .meta { color: var(--muted); margin: 0 0 24px; }
-    table { border-collapse: collapse; width: 100%; margin-top: 20px; font-size: 14px; }
-    th, td { border-bottom: 1px solid var(--line); padding: 12px 8px; text-align: left; vertical-align: top; }
-    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
-    a { color: var(--accent); overflow-wrap: anywhere; }
-    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 28px 0 12px; flex-wrap: wrap; }
-  </style>
-</head>
-<body>
-  <main>
-    <p class="meta">Freedium extraction UI · source URL registry · duplicate skip</p>
-    <h1>Article Scrapper</h1>
-    <section class="panel">
-      <form method="post" action="/scrape">
-        <textarea name="urls" placeholder="Paste article URLs only, one per line. Do not paste Medium feed/profile/list URLs." required></textarea>
-        <button type="submit" ${isScraping ? "disabled" : ""}>${isScraping ? "Scraping..." : "Scrape URL(s)"}</button>
-      </form>
-      ${message ? `<p class="message">${escapeHtml(message)}</p>` : ""}
-    </section>
-    <div class="toolbar">
-      <h2>Scraped Sources (${records.length})</h2>
-      <form method="post" action="/reset">
-        <button class="danger" type="submit">Reset Database</button>
-      </form>
-    </div>
-    <section class="panel">
-      <table>
-        <thead><tr><th>Source URL</th><th>Scraped At</th><th>Output</th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="3">No scraped URLs yet.</td></tr>`}</tbody>
-      </table>
-    </section>
-  </main>
-</body>
-</html>`);
-}
-
-async function readRequestBody(request: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-function redirect(response: ServerResponse, location: string): void {
-  response.writeHead(303, { Location: location });
-  response.end();
 }
 
 function openTrackingDatabase(dbFile: string): DatabaseSync {
@@ -471,12 +1109,6 @@ function getScrapedUrlRecord(db: DatabaseSync, sourceUrl: string): ScrapedUrlRec
   return row ?? null;
 }
 
-function listScrapedUrlRecords(db: DatabaseSync): ScrapedUrlRecord[] {
-  return db
-    .prepare("SELECT source_url AS sourceUrl, output_path AS outputPath, scraped_at AS scrapedAt FROM scraped_urls ORDER BY scraped_at DESC")
-    .all() as ScrapedUrlRecord[];
-}
-
 function upsertScrapedUrlRecord(db: DatabaseSync, record: ScrapedUrlRecord): void {
   db
     .prepare(`
@@ -502,24 +1134,32 @@ function createSingleArticle(inputUrl: string): Article {
 }
 
 function assertArticleUrl(sourceUrl: string): void {
+  if (isArticleUrl(sourceUrl)) {
+    return;
+  }
+
+  throw new Error(`Not an article URL: ${sourceUrl}`);
+}
+
+function isArticleUrl(sourceUrl: string): boolean {
   const parsed = new URL(sourceUrl);
   const segments = parsed.pathname.split("/").filter(Boolean);
   const firstSegment = segments[0] ?? "";
   const lastSegment = segments.at(-1) ?? "";
 
   if (BLOCKED_MEDIUM_PATH_PREFIXES.has(firstSegment) || segments.includes("following-feed")) {
-    throw new Error(`Not an article URL: ${sourceUrl}`);
+    return false;
   }
 
   if (segments[0] === "p" && /^[a-f0-9]{8,}$/i.test(lastSegment)) {
-    return;
+    return true;
   }
 
   if (/^[a-z0-9-]+-[a-f0-9]{8,}$/i.test(lastSegment)) {
-    return;
+    return true;
   }
 
-  throw new Error(`Not an article URL: ${sourceUrl}`);
+  return false;
 }
 
 async function openBrowserSession(browserName: BrowserName, headless: boolean, connectUrl: string | null) {
@@ -558,17 +1198,22 @@ async function extractArticleContent(
   const page = await context.newPage();
 
   try {
+    logInfo(`Freedium open: ${TARGET_URL}`);
     await page.goto(TARGET_URL, { waitUntil: "domcontentloaded" });
 
     const urlInput = page.locator('input[type="text"], input[type="url"], textarea').first();
+    logInfo(`Freedium waiting for URL input: ${article.sourceUrl}`);
     await urlInput.waitFor({ state: "visible", timeout: 30000 });
     await urlInput.fill(article.sourceUrl);
+    logInfo(`Freedium submitted: ${article.sourceUrl}`);
     await urlInput.press("Enter");
 
     await page.waitForURL((currentUrl) => currentUrl.pathname !== "/", { timeout: 30000 });
+    logInfo(`Freedium result URL: ${page.url()}`);
     await assertNoSecurityVerification(page, article.sourceUrl);
 
     const mainContent = page.locator(".main-content, main, article, .content").first();
+    logInfo(`Freedium waiting for content: ${article.sourceUrl}`);
     await mainContent.waitFor({ state: "visible", timeout: 30000 });
     const footerContent = await page
       .locator(".flex.flex-wrap.gap-2.mt-5")
@@ -582,6 +1227,7 @@ async function extractArticleContent(
       throw new Error(`Empty content extracted for ${article.sourceUrl}`);
     }
     validateExtractedContent(content, article.sourceUrl);
+    logInfo(`Freedium content extracted: ${article.sourceUrl} chars=${content.length}`);
 
     return {
       article,
@@ -590,8 +1236,7 @@ async function extractArticleContent(
     };
   } catch (error) {
     const safeName = `${String(index).padStart(3, "0")}-${slugify(article.title)}`;
-    await page.screenshot({ path: path.join(outputDir, `${safeName}.png`), fullPage: true }).catch(() => undefined);
-    await writeFile(path.join(outputDir, `${safeName}.html`), await page.content(), "utf8").catch(() => undefined);
+    await saveDebugPage(page, outputDir, safeName);
     throw error;
   } finally {
     await page.close();
@@ -605,12 +1250,21 @@ async function assertNoSecurityVerification(page: Page, sourceUrl: string): Prom
 
   for (const pattern of SECURITY_VERIFICATION_PATTERNS) {
     if (combinedText.includes(pattern)) {
+      logWarn(`Anti-bot verification detected for ${sourceUrl} with pattern "${pattern}" at ${page.url()}`);
       throw new Error(
         `Blocked by an anti-bot verification page while loading ${sourceUrl}. ` +
         "The scraper did not extract article content."
       );
     }
   }
+}
+
+async function saveDebugPage(page: Page, outputDir: string, baseName: string): Promise<void> {
+  const htmlPath = path.join(outputDir, `${baseName}.html`);
+  const screenshotPath = path.join(outputDir, `${baseName}.png`);
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+  await writeFile(htmlPath, await page.content(), "utf8").catch(() => undefined);
+  logWarn(`Saved debug page artifacts: ${htmlPath} and ${screenshotPath}`);
 }
 
 function validateExtractedContent(content: string, sourceUrl: string): void {
@@ -694,17 +1348,32 @@ function normalizeText(value: string): string {
     .trim();
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+function logInfo(message: string): void {
+  console.log(formatLogMessage("info", message));
+}
+
+function logWarn(message: string): void {
+  console.warn(formatLogMessage("warn", message));
+}
+
+function logError(message: string): void {
+  console.error(formatLogMessage("error", message));
+}
+
+function formatLogMessage(level: "error" | "info" | "warn", message: string): string {
+  return `[${new Date().toISOString()}] [${level}] ${message}`;
+}
+
+function base64UrlEncode(value: Uint8Array): string {
+  return Buffer.from(value)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 main().catch((error: unknown) => {
   const message = error instanceof Error ? error.stack || error.message : String(error);
-  console.error(message);
+  logError(message);
   process.exitCode = 1;
 });

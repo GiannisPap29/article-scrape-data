@@ -1,5 +1,9 @@
 node_modules
 dist
+*.tsbuildinfo
 playwright-report
 test-results
-data/output/*
+data/*
+
+.env
+.make.local
