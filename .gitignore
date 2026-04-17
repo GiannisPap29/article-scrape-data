@@ -6,4 +6,3 @@ test-results
 data/*
 
 .env
-.make.local

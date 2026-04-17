@@ -284,11 +284,6 @@ function parseCliArgs(args: string[]): CliOptions {
       continue;
     }
 
-    if (arg.startsWith("--trackingFile=")) {
-      dbFile = requiredFlagValue(arg, "--trackingFile");
-      continue;
-    }
-
     if (arg.startsWith("--dbFile=")) {
       dbFile = requiredFlagValue(arg, "--dbFile");
       continue;
