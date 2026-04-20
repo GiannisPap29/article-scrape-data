@@ -1,6 +1,6 @@
 # web-scrapper
 
-Medium article extraction through Freedium with SQLite URL history, using a Google Drive folder as the input queue.
+Medium article extraction through Freedium with a two-stage Google Drive queue.
 
 ## Configuration
 
@@ -12,17 +12,20 @@ Runtime settings are loaded from a root `.env` file.
 
 ## What it does
 
-- Watches one exact Google Drive folder for Google Docs or plain text files that contain one Medium article URL.
-- Skips URLs already present in `data/scraped-urls.db`.
-- Deletes processed Drive files on DB hit or scrape success.
+- Reads one exact Google Drive inbox folder for Google Docs or plain text files that contain one Medium article URL.
+- Enqueues new URLs into `data/url_from_drive.db`.
+- Skips URLs already present in `data/scraped-urls.db` or already present in the queue DB.
+- Moves ingested Drive files into an archive folder.
 - Moves failed Drive files into a failure folder.
-- Stores extracted article text in `data/output/`.
+- Scrapes queued URLs through Freedium and stores extracted text in `data/output/`.
+- Promotes successful queue entries into `data/scraped-urls.db`.
 
 ## Workspace layout
 
 - `apps/scraper`: CLI scraper and Drive watcher
 - `packages/config`: shared defaults
 - `data/output`: extracted text files and debug artifacts
+- `data/url_from_drive.db`: staged URL queue from Drive
 - `data/scraped-urls.db`: SQLite history of scraped source URLs
 - `data/oauth/google-client.json`: Google OAuth desktop client credentials
 - `data/oauth/google-token.json`: stored OAuth access/refresh tokens
@@ -59,30 +62,37 @@ Or pass a custom path through `GOOGLE_OAUTH_CLIENT_FILE`.
 
 ## Commands
 
-Process the watched Google Drive folder once:
+Read the Drive inbox and enqueue new URLs into `url_from_drive.db`:
 
 ```bash
-make scan
+make ingest
 ```
 
-Watch Google Drive forever, polling every 30 minutes:
+Scrape every queued URL from `url_from_drive.db` and move successful ones into `scraped-urls.db`:
 
 ```bash
-make watch
+make scrape-queue
+```
+
+Re-scrape every URL already stored in `scraped-urls.db` and refresh the local `.txt` output files:
+
+```bash
+make rescan
 ```
 
 Run with a visible browser for Freedium extraction:
 
 ```bash
-make scan HEADLESS=false
-make watch HEADLESS=false
+make ingest HEADLESS=false
+make scrape-queue HEADLESS=false
+make rescan HEADLESS=false
 ```
 
 Attach to an existing Chrome/Edge DevTools session:
 
 ```bash
 google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/medium-debug
-make scan CONNECT_URL="http://127.0.0.1:9222" HEADLESS=false
+make scrape-queue CONNECT_URL="http://127.0.0.1:9222" HEADLESS=false
 ```
 
 Inspect the SQLite history:
@@ -99,9 +109,10 @@ make reset-db
 
 ## Google Drive workflow
 
-The Drive watcher expects:
+The Drive workflow expects:
 
 - one exact watched folder ID via `DRIVE_FOLDER_ID` in `.env`
+- optional archive folder via `DRIVE_ARCHIVE_FOLDER_ID`
 - native Google Docs or plain text files
 - one Medium article URL per file body
 
@@ -111,22 +122,40 @@ Example file content:
 Read “One of These Numbers Doesn’t Fit in Reality“ by Abhinav on Medium: https://codingplainenglish.medium.com/one-of-these-numbers-doesnt-fit-in-reality-749194f3dbf3
 ```
 
-For each supported file in the watched folder:
+### Ingest stage
+
+For each supported file in the Drive inbox:
 
 1. Read the body through the Google Docs API for native docs, or download the text content for plain text files.
 2. Extract exactly one valid Medium/Freedium article URL.
-3. Check SQLite history.
-4. If already scraped, delete the Drive file.
-5. If new, scrape through Freedium, save output locally, update SQLite, then delete the Drive file.
-6. If parsing or scraping fails, move the Drive file into the failure folder.
+3. Check `data/scraped-urls.db`.
+4. Check `data/url_from_drive.db`.
+5. If already scraped, archive the Drive file and do not queue it.
+6. If already queued, archive the Drive file and do not queue it again.
+7. If new, insert it into `data/url_from_drive.db`, then archive the Drive file.
+8. If parsing fails, move the Drive file into the failure folder.
+
+### Queue scrape stage
+
+For each queued URL in `data/url_from_drive.db`:
+
+1. Read queued rows oldest-first.
+2. If the URL is already in `data/scraped-urls.db`, remove it from the queue DB.
+3. If not, scrape it through Freedium.
+4. Save or refresh the local `.txt` file in `data/output/`.
+5. Upsert the success row into `data/scraped-urls.db`.
+6. Delete the successful row from `data/url_from_drive.db`.
+7. On scrape failure, keep the row in `data/url_from_drive.db` and update `last_error`.
+
+If `DRIVE_ARCHIVE_FOLDER_ID` is not set, the app creates or reuses a sibling folder named `<WATCHED_FOLDER_NAME>_ARCHIVED`.
 
 If `DRIVE_FAILED_FOLDER_ID` is not set, the app creates or reuses a sibling folder named `<WATCHED_FOLDER_NAME>_FAILED`.
 
-If the watched folder is empty, the scan does nothing and exits cleanly.
+If the watched folder is empty, `make ingest` does nothing and exits cleanly.
 
 ## First-time OAuth flow
 
-On the first `scan-drive` or `watch-drive` run:
+On the first `make ingest` run:
 
 1. The app starts a temporary local callback server on `127.0.0.1`.
 2. It prints a Google authorization URL.
@@ -143,17 +172,20 @@ After that, the watcher reuses the refresh token and should not require repeated
 - `HEADLESS=true|false`
 - `OUTPUT_DIR=./data/output`
 - `DB_FILE=./data/scraped-urls.db`
+- `URL_QUEUE_DB_FILE=./data/url_from_drive.db`
 - `DRIVE_FOLDER_ID=<google-drive-folder-id>`
+- `DRIVE_ARCHIVE_FOLDER_ID=<google-drive-folder-id>`
 - `DRIVE_FAILED_FOLDER_ID=<google-drive-folder-id>`
 - `GOOGLE_OAUTH_CLIENT_FILE=./data/oauth/google-client.json`
 - `GOOGLE_OAUTH_TOKEN_FILE=./data/oauth/google-token.json`
-- `POLL_INTERVAL_MINUTES=30`
-
 ## Notes
 
 - Each Drive file must contain exactly one direct article URL, not a Medium profile/feed/list URL.
-- The Drive watcher processes files sequentially in `modifiedTime` ascending order.
-- Duplicate checks happen before browser extraction using the normalized `source_url`.
+- The ingest stage processes Drive files sequentially in `modifiedTime` ascending order.
+- The queue scrape stage processes queued URLs sequentially in `queued_at` ascending order.
+- `data/url_from_drive.db` is the durable staging queue.
+- `data/scraped-urls.db` is the final success history.
+- `make rescan` ignores the duplicate skip and re-scrapes every tracked `source_url` already stored in `data/scraped-urls.db`.
 - SQLite table: `scraped_urls(source_url, output_path, scraped_at)`.
 - `make reset-db` clears only SQLite history, not existing output files.
 - `make clean-output` removes local `.txt`, `.html`, and `.png` output artifacts.

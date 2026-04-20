@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { type AddressInfo } from "node:net";
 import path from "node:path";
@@ -13,36 +13,38 @@ import {
   DEFAULT_GOOGLE_OAUTH_CLIENT_FILE,
   DEFAULT_GOOGLE_OAUTH_TOKEN_FILE,
   DEFAULT_OUTPUT_DIR,
-  DEFAULT_POLL_INTERVAL_MINUTES,
+  DEFAULT_URL_QUEUE_DB_FILE,
   GOOGLE_DRIVE_SCOPE,
   TARGET_URL
 } from "@web-scrapper/config";
 
 type BrowserName = "chrome" | "msedge" | "firefox" | "webkit";
-type Command = "reset" | "scan-drive" | "watch-drive";
+type Command = "ingest-drive" | "rescan-db" | "reset" | "scrape-queue";
 
 type CliOptions = {
   browser: BrowserName;
   command: Command;
   connectUrl: string | null;
   dbFile: string;
+  driveArchiveFolderId: string | null;
   driveFailedFolderId: string | null;
   driveFolderId: string | null;
   headless: boolean;
   oauthClientFile: string;
   oauthTokenFile: string;
   outputDir: string;
-  pollIntervalMinutes: number;
+  queueDbFile: string;
 };
 
-type DriveWatcherOptions = {
+type DriveWorkerOptions = {
   dbFile: string;
+  driveArchiveFolderId: string | null;
   driveFailedFolderId: string | null;
   driveFolderId: string;
   oauthClientFile: string;
   oauthTokenFile: string;
   outputDir: string;
-  pollIntervalMinutes: number;
+  queueDbFile: string;
 } & Pick<CliOptions, "browser" | "connectUrl" | "headless">;
 
 type Article = {
@@ -70,13 +72,14 @@ type DriveListResponse = {
   nextPageToken?: string;
 };
 
-type DriveScanSummary = {
-  deleted: number;
+type DriveIngestSummary = {
+  archived: number;
   failed: number;
   movedToFailure: number;
-  saved: number;
   skippedExisting: number;
-  totalDocs: number;
+  skippedQueued: number;
+  queued: number;
+  totalFiles: number;
 };
 
 type ExtractionResult = {
@@ -112,16 +115,25 @@ type OAuthCallbackResult = {
   redirectUri: string;
 };
 
-type ScrapeResult = {
-  outputPath: string;
-  sourceUrl: string;
-  status: "saved" | "skipped";
-};
-
 type ScrapedUrlRecord = {
   outputPath: string;
   scrapedAt: string;
   sourceUrl: string;
+};
+
+type QueueUrlRecord = {
+  driveFileId: string;
+  driveFileName: string;
+  lastError: string | null;
+  queuedAt: string;
+  sourceUrl: string;
+};
+
+type QueueScrapeSummary = {
+  failed: number;
+  removedAlreadyScraped: number;
+  saved: number;
+  totalQueued: number;
 };
 
 type StructuralElement = {
@@ -180,7 +192,7 @@ const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
 async function main(): Promise<void> {
   loadDotEnv(path.resolve(process.cwd(), ".env"));
   const options = parseCliArgs(process.argv.slice(2));
-  logInfo(`Starting command=${options.command} browser=${options.browser} headless=${options.headless} outputDir=${options.outputDir} dbFile=${options.dbFile}`);
+  logInfo(`Starting command=${options.command} browser=${options.browser} headless=${options.headless} outputDir=${options.outputDir} dbFile=${options.dbFile} queueDbFile=${options.queueDbFile}`);
 
   if (options.command === "reset") {
     resetTrackingDatabase(path.resolve(process.cwd(), options.dbFile));
@@ -188,14 +200,21 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (options.command === "scan-drive") {
-    const summary = await scanDriveQueue(resolveDriveWatcherOptions(options));
-    logInfo(`Drive scan finished: totalDocs=${summary.totalDocs} saved=${summary.saved} skippedExisting=${summary.skippedExisting} movedToFailure=${summary.movedToFailure} deleted=${summary.deleted} failed=${summary.failed}`);
+  if (options.command === "rescan-db") {
+    const summary = await rescrapeTrackedUrls(options);
+    logInfo(`DB rescan finished: total=${summary.total} saved=${summary.saved} rescraped=${summary.rescraped} skipped=${summary.skipped} failed=${summary.failed}`);
     return;
   }
 
-  if (options.command === "watch-drive") {
-    await watchDriveQueue(resolveDriveWatcherOptions(options));
+  if (options.command === "ingest-drive") {
+    const summary = await ingestDriveQueue(resolveDriveWorkerOptions(options));
+    logInfo(`Drive ingest finished: totalFiles=${summary.totalFiles} queued=${summary.queued} skippedExisting=${summary.skippedExisting} skippedQueued=${summary.skippedQueued} archived=${summary.archived} movedToFailure=${summary.movedToFailure} failed=${summary.failed}`);
+    return;
+  }
+
+  if (options.command === "scrape-queue") {
+    const summary = await scrapeQueuedUrls(options);
+    logInfo(`Queue scrape finished: totalQueued=${summary.totalQueued} saved=${summary.saved} removedAlreadyScraped=${summary.removedAlreadyScraped} failed=${summary.failed}`);
     return;
   }
 }
@@ -233,30 +252,35 @@ function loadDotEnv(filePath: string): void {
 
 function parseCliArgs(args: string[]): CliOptions {
   let browser: BrowserName = "chrome";
-  let command: Command = "scan-drive";
+  let command: Command = "ingest-drive";
   let connectUrl: string | null = readEnv("CONNECT_URL");
   let headless = readEnv("HEADLESS") !== "false";
   let outputDir = readEnv("OUTPUT_DIR") ?? DEFAULT_OUTPUT_DIR;
   let dbFile = readEnv("DB_FILE") ?? DEFAULT_DB_FILE;
+  let queueDbFile = readEnv("URL_QUEUE_DB_FILE") ?? DEFAULT_URL_QUEUE_DB_FILE;
   let driveFolderId = readEnv("DRIVE_FOLDER_ID");
+  let driveArchiveFolderId = readEnv("DRIVE_ARCHIVE_FOLDER_ID");
   let driveFailedFolderId = readEnv("DRIVE_FAILED_FOLDER_ID");
   let oauthClientFile = readEnv("GOOGLE_OAUTH_CLIENT_FILE") ?? DEFAULT_GOOGLE_OAUTH_CLIENT_FILE;
   let oauthTokenFile = readEnv("GOOGLE_OAUTH_TOKEN_FILE") ?? DEFAULT_GOOGLE_OAUTH_TOKEN_FILE;
-  let pollIntervalMinutes = parsePositiveInteger(readEnv("POLL_INTERVAL_MINUTES"), "POLL_INTERVAL_MINUTES", DEFAULT_POLL_INTERVAL_MINUTES);
-
   for (const arg of args) {
     if (arg === "--reset") {
       command = "reset";
       continue;
     }
 
-    if (arg === "--scan-drive") {
-      command = "scan-drive";
+    if (arg === "--rescan-db") {
+      command = "rescan-db";
       continue;
     }
 
-    if (arg === "--watch-drive") {
-      command = "watch-drive";
+    if (arg === "--ingest-drive") {
+      command = "ingest-drive";
+      continue;
+    }
+
+    if (arg === "--scrape-queue") {
+      command = "scrape-queue";
       continue;
     }
 
@@ -289,8 +313,18 @@ function parseCliArgs(args: string[]): CliOptions {
       continue;
     }
 
+    if (arg.startsWith("--queueDbFile=")) {
+      queueDbFile = requiredFlagValue(arg, "--queueDbFile");
+      continue;
+    }
+
     if (arg.startsWith("--driveFolderId=")) {
       driveFolderId = requiredFlagValue(arg, "--driveFolderId");
+      continue;
+    }
+
+    if (arg.startsWith("--driveArchiveFolderId=")) {
+      driveArchiveFolderId = requiredFlagValue(arg, "--driveArchiveFolderId");
       continue;
     }
 
@@ -309,9 +343,6 @@ function parseCliArgs(args: string[]): CliOptions {
       continue;
     }
 
-    if (arg.startsWith("--pollIntervalMinutes=")) {
-      pollIntervalMinutes = parsePositiveInteger(requiredFlagValue(arg, "--pollIntervalMinutes"), "--pollIntervalMinutes");
-    }
   }
 
   return {
@@ -319,13 +350,14 @@ function parseCliArgs(args: string[]): CliOptions {
     command,
     connectUrl,
     dbFile,
+    driveArchiveFolderId,
     driveFailedFolderId,
     driveFolderId,
     headless,
     oauthClientFile,
     oauthTokenFile,
     outputDir,
-    pollIntervalMinutes
+    queueDbFile
   };
 }
 
@@ -359,117 +391,242 @@ function readEnv(name: string): string | null {
   return value ? value : null;
 }
 
-function resolveDriveWatcherOptions(options: CliOptions): DriveWatcherOptions {
+function resolveDriveWorkerOptions(options: CliOptions): DriveWorkerOptions {
   if (!options.driveFolderId) {
-    throw new Error("Missing DRIVE_FOLDER_ID or --driveFolderId for Drive watcher commands.");
+    throw new Error("Missing DRIVE_FOLDER_ID or --driveFolderId for Drive commands.");
   }
 
   return {
     browser: options.browser,
     connectUrl: options.connectUrl,
     dbFile: options.dbFile,
+    driveArchiveFolderId: options.driveArchiveFolderId,
     driveFailedFolderId: options.driveFailedFolderId,
     driveFolderId: options.driveFolderId,
     headless: options.headless,
     oauthClientFile: options.oauthClientFile,
     oauthTokenFile: options.oauthTokenFile,
     outputDir: options.outputDir,
-    pollIntervalMinutes: options.pollIntervalMinutes
+    queueDbFile: options.queueDbFile
   };
 }
 
-async function watchDriveQueue(options: DriveWatcherOptions): Promise<void> {
-  const pollMs = options.pollIntervalMinutes * 60 * 1000;
-  logInfo(`Watching Google Drive folder ${options.driveFolderId} every ${options.pollIntervalMinutes} minute(s).`);
-
-  for (;;) {
-    try {
-      const summary = await scanDriveQueue(options);
-      logInfo(`Watch cycle complete: totalDocs=${summary.totalDocs} saved=${summary.saved} skippedExisting=${summary.skippedExisting} movedToFailure=${summary.movedToFailure} deleted=${summary.deleted} failed=${summary.failed}`);
-    } catch (error) {
-      logError(`Watch cycle failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    logInfo(`Sleeping for ${options.pollIntervalMinutes} minute(s) before next Drive scan.`);
-    await delay(pollMs);
-  }
-}
-
-async function scanDriveQueue(options: DriveWatcherOptions): Promise<DriveScanSummary> {
+async function ingestDriveQueue(options: DriveWorkerOptions): Promise<DriveIngestSummary> {
   const dbFile = path.resolve(process.cwd(), options.dbFile);
-  const outputDir = path.resolve(process.cwd(), options.outputDir);
+  const queueDbFile = path.resolve(process.cwd(), options.queueDbFile);
   const oauthClientFile = path.resolve(process.cwd(), options.oauthClientFile);
   const oauthTokenFile = path.resolve(process.cwd(), options.oauthTokenFile);
 
-  await mkdir(outputDir, { recursive: true });
-
-  logInfo(`Drive scan start: folderId=${options.driveFolderId}`);
+  logInfo(`Drive ingest start: folderId=${options.driveFolderId}`);
   const session = await getGoogleAccessSession(oauthClientFile, oauthTokenFile);
+  const archiveFolderId = await resolveArchiveFolderId(session, options.driveFolderId, options.driveArchiveFolderId);
   const failureFolderId = await resolveFailureFolderId(session, options.driveFolderId, options.driveFailedFolderId);
+  const scrapedDb = openTrackingDatabase(dbFile);
+  const queueDb = openQueueDatabase(queueDbFile);
 
-  if (failureFolderId === options.driveFolderId) {
-    throw new Error("Drive failure folder must be different from DRIVE_FOLDER_ID.");
-  }
+  try {
+    if (archiveFolderId === options.driveFolderId || failureFolderId === options.driveFolderId) {
+      throw new Error("Drive archive/failure folders must be different from DRIVE_FOLDER_ID.");
+    }
 
-  const docs = await listSupportedDriveFilesInFolder(session, options.driveFolderId);
-  if (docs.length === 0) {
-    logInfo("Drive scan found no supported files to process.");
-    return {
-      deleted: 0,
+    if (archiveFolderId === failureFolderId) {
+      throw new Error("Drive archive folder must be different from the failure folder.");
+    }
+
+    const files = await listSupportedDriveFilesInFolder(session, options.driveFolderId);
+    if (files.length === 0) {
+      logInfo("Drive ingest found no supported files to process.");
+      return {
+        archived: 0,
+        failed: 0,
+        movedToFailure: 0,
+        queued: 0,
+        skippedExisting: 0,
+        skippedQueued: 0,
+        totalFiles: 0
+      };
+    }
+
+    logInfo(`Drive ingest found ${files.length} supported file(s).`);
+    const summary: DriveIngestSummary = {
+      archived: 0,
       failed: 0,
       movedToFailure: 0,
-      saved: 0,
+      queued: 0,
       skippedExisting: 0,
-      totalDocs: 0
+      skippedQueued: 0,
+      totalFiles: files.length
+    };
+
+    for (const file of files) {
+      logInfo(`Drive ingest file start: ${file.name} (${file.id}) mimeType=${file.mimeType ?? "unknown"}`);
+
+      try {
+        const text = await getDriveFileText(session, file);
+        const sourceUrl = extractSingleArticleUrlFromText(text);
+        logInfo(`Drive ingest URL extracted: ${file.name} (${file.id}) -> ${sourceUrl}`);
+
+        if (getScrapedUrlRecord(scrapedDb, sourceUrl)) {
+          await moveDriveFileToFolder(session, file.id, archiveFolderId);
+          summary.archived += 1;
+          summary.skippedExisting += 1;
+          logInfo(`Drive file archived after scraped DB match: ${file.name} (${file.id})`);
+          continue;
+        }
+
+        if (getQueuedUrlRecord(queueDb, sourceUrl)) {
+          await moveDriveFileToFolder(session, file.id, archiveFolderId);
+          summary.archived += 1;
+          summary.skippedQueued += 1;
+          logInfo(`Drive file archived after queue DB match: ${file.name} (${file.id})`);
+          continue;
+        }
+
+        insertQueuedUrlRecord(queueDb, {
+          driveFileId: file.id,
+          driveFileName: file.name,
+          lastError: null,
+          queuedAt: new Date().toISOString(),
+          sourceUrl
+        });
+        logInfo(`Queue inserted: ${sourceUrl} from ${file.name} (${file.id})`);
+
+        await moveDriveFileToFolder(session, file.id, archiveFolderId);
+        summary.archived += 1;
+        summary.queued += 1;
+        logInfo(`Drive file archived after queue insert: ${file.name} (${file.id})`);
+      } catch (error) {
+        summary.failed += 1;
+        try {
+          await moveDriveFileToFolder(session, file.id, failureFolderId);
+          summary.movedToFailure += 1;
+          logWarn(`Drive file moved to failure folder: ${file.name} (${file.id})`);
+        } catch (moveError) {
+          logError(`Failed to move Drive file to failure folder: ${file.name} (${file.id}): ${moveError instanceof Error ? moveError.message : String(moveError)}`);
+        }
+
+        logError(`Drive ingest failed: ${file.name} (${file.id}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    return summary;
+  } finally {
+    queueDb.close();
+    scrapedDb.close();
+  }
+}
+
+async function scrapeQueuedUrls(
+  options: Pick<CliOptions, "browser" | "connectUrl" | "dbFile" | "headless" | "outputDir" | "queueDbFile">
+): Promise<QueueScrapeSummary> {
+  const dbFile = path.resolve(process.cwd(), options.dbFile);
+  const queueDbFile = path.resolve(process.cwd(), options.queueDbFile);
+  const scrapedDb = openTrackingDatabase(dbFile);
+  const queueDb = openQueueDatabase(queueDbFile);
+
+  try {
+    const records = getAllQueuedUrlRecords(queueDb);
+    if (records.length === 0) {
+      logInfo("Queue scrape found no queued URLs.");
+      return {
+        failed: 0,
+        removedAlreadyScraped: 0,
+        saved: 0,
+        totalQueued: 0
+      };
+    }
+
+    logInfo(`Queue scrape queued ${records.length} URL(s).`);
+    const summary: QueueScrapeSummary = {
+      failed: 0,
+      removedAlreadyScraped: 0,
+      saved: 0,
+      totalQueued: records.length
+    };
+
+    for (const [index, record] of records.entries()) {
+      try {
+        logInfo(`Queue scrape start: ${record.sourceUrl}`);
+        const existingRecord = getScrapedUrlRecord(scrapedDb, record.sourceUrl);
+        if (existingRecord) {
+          deleteQueuedUrlRecord(queueDb, record.sourceUrl);
+          summary.removedAlreadyScraped += 1;
+          logInfo(`Queue row removed because URL already exists in scraped DB: ${record.sourceUrl}`);
+          continue;
+        }
+
+        const result = await scrapeAndWriteUrl(record.sourceUrl, options, index + 1, null);
+        upsertScrapedUrlRecord(scrapedDb, {
+          outputPath: result.outputPath,
+          scrapedAt: new Date().toISOString(),
+          sourceUrl: result.sourceUrl
+        });
+        deleteQueuedUrlRecord(queueDb, record.sourceUrl);
+        summary.saved += 1;
+        logInfo(`Queue scrape saved: ${result.sourceUrl} -> ${result.outputPath}`);
+      } catch (error) {
+        summary.failed += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        updateQueuedUrlError(queueDb, record.sourceUrl, message);
+        logError(`Queue scrape failed: ${record.sourceUrl}: ${message}`);
+      }
+    }
+
+    return summary;
+  } finally {
+    queueDb.close();
+    scrapedDb.close();
+  }
+}
+
+async function rescrapeTrackedUrls(
+  options: Pick<CliOptions, "browser" | "connectUrl" | "dbFile" | "headless" | "outputDir">
+): Promise<{ failed: number; rescraped: number; saved: number; skipped: number; total: number; }> {
+  const dbFile = path.resolve(process.cwd(), options.dbFile);
+  const db = openTrackingDatabase(dbFile);
+  const records = getAllScrapedUrlRecords(db);
+  db.close();
+
+  if (records.length === 0) {
+    logInfo("DB rescan found no tracked URLs.");
+    return {
+      failed: 0,
+      rescraped: 0,
+      saved: 0,
+      skipped: 0,
+      total: 0
     };
   }
 
-  logInfo(`Drive scan found ${docs.length} supported file(s).`);
-  const summary: DriveScanSummary = {
-    deleted: 0,
-    failed: 0,
-    movedToFailure: 0,
-    saved: 0,
-    skippedExisting: 0,
-    totalDocs: docs.length
-  };
+  logInfo(`DB rescan queued ${records.length} tracked URL(s).`);
+  let failed = 0;
+  let rescraped = 0;
+  let skipped = 0;
 
-  for (const [index, doc] of docs.entries()) {
-    logInfo(`Drive file start: ${doc.name} (${doc.id}) mimeType=${doc.mimeType ?? "unknown"}`);
-
+  for (const [index, record] of records.entries()) {
     try {
-      const text = await getDriveFileText(session, doc);
-      const sourceUrl = extractSingleArticleUrlFromText(text);
-      logInfo(`Drive file URL extracted: ${doc.name} (${doc.id}) -> ${sourceUrl}`);
-
-      const scrapeResult = await scrapeSingleUrl(sourceUrl, options, index + 1);
-      if (scrapeResult.status === "skipped") {
-        await deleteDriveFile(session, doc.id);
-        summary.deleted += 1;
-        summary.skippedExisting += 1;
-        logInfo(`Drive file deleted after DB match: ${doc.name} (${doc.id})`);
-        continue;
-      }
-
-      await deleteDriveFile(session, doc.id);
-      summary.deleted += 1;
-      summary.saved += 1;
-      logInfo(`Drive file deleted after successful scrape: ${doc.name} (${doc.id})`);
+      logInfo(`DB rescan start: ${record.sourceUrl}`);
+      const result = await scrapeAndWriteUrl(record.sourceUrl, options, index + 1, record.outputPath);
+      upsertScrapedUrlRecord(db, {
+        outputPath: result.outputPath,
+        scrapedAt: new Date().toISOString(),
+        sourceUrl: result.sourceUrl
+      });
+      rescraped += 1;
+      logInfo(`DB rescan updated: ${result.sourceUrl} -> ${result.outputPath}`);
     } catch (error) {
-      summary.failed += 1;
-      try {
-        await moveDriveFileToFolder(session, doc.id, failureFolderId);
-        summary.movedToFailure += 1;
-        logWarn(`Drive file moved to failure folder: ${doc.name} (${doc.id})`);
-      } catch (moveError) {
-        logError(`Failed to move Drive file to failure folder: ${doc.name} (${doc.id}): ${moveError instanceof Error ? moveError.message : String(moveError)}`);
-      }
-
-      logError(`Drive file processing failed: ${doc.name} (${doc.id}): ${error instanceof Error ? error.message : String(error)}`);
+      failed += 1;
+      logError(`DB rescan failed: ${record.sourceUrl}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  return summary;
+  return {
+    failed,
+    rescraped,
+    saved: rescraped,
+    skipped,
+    total: records.length
+  };
 }
 
 async function getGoogleAccessSession(clientFile: string, tokenFile: string): Promise<GoogleOAuthToken> {
@@ -924,6 +1081,27 @@ async function resolveFailureFolderId(
   return createDriveFolder(session, folderName, parentId);
 }
 
+async function resolveArchiveFolderId(
+  session: GoogleOAuthToken,
+  watchedFolderId: string,
+  configuredArchiveFolderId: string | null
+): Promise<string> {
+  if (configuredArchiveFolderId) {
+    return configuredArchiveFolderId;
+  }
+
+  const watchedFolder = await getDriveFileParents(session, watchedFolderId);
+  const parentId = watchedFolder.parents?.[0] ?? "root";
+  const folderName = `${watchedFolder.name ?? "MEDIUM"}_ARCHIVED`;
+  const existingFolderId = await findFolderIdByName(session, folderName, parentId);
+
+  if (existingFolderId) {
+    return existingFolderId;
+  }
+
+  return createDriveFolder(session, folderName, parentId);
+}
+
 async function getDriveFileParents(session: GoogleOAuthToken, fileId: string): Promise<DriveFileParentsResponse> {
   const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
   url.searchParams.set("fields", "id,name,parents");
@@ -948,7 +1126,7 @@ function escapeDriveQueryValue(value: string): string {
 }
 
 async function createDriveFolder(session: GoogleOAuthToken, name: string, parentId: string): Promise<string> {
-  logInfo(`Creating Drive failure folder "${name}" under parent ${parentId}.`);
+  logInfo(`Creating Drive folder "${name}" under parent ${parentId}.`);
   const response = await googleApiRequest<{ id: string; }>(
     session,
     new URL("https://www.googleapis.com/drive/v3/files?supportsAllDrives=true"),
@@ -966,12 +1144,6 @@ async function createDriveFolder(session: GoogleOAuthToken, name: string, parent
   );
 
   return response.id;
-}
-
-async function deleteDriveFile(session: GoogleOAuthToken, fileId: string): Promise<void> {
-  const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`);
-  url.searchParams.set("supportsAllDrives", "true");
-  await googleApiRequest(session, url, { method: "DELETE" });
 }
 
 async function moveDriveFileToFolder(session: GoogleOAuthToken, fileId: string, folderId: string): Promise<void> {
@@ -992,6 +1164,22 @@ async function moveDriveFileToFolder(session: GoogleOAuthToken, fileId: string, 
       "Content-Type": "application/json"
     }
   });
+}
+
+function openQueueDatabase(queueDbFile: string): DatabaseSync {
+  mkdirSyncLike(path.dirname(queueDbFile));
+  const db = new DatabaseSync(queueDbFile);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS url_from_drive (
+      source_url TEXT PRIMARY KEY,
+      drive_file_id TEXT NOT NULL,
+      drive_file_name TEXT NOT NULL,
+      queued_at TEXT NOT NULL,
+      last_error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_url_from_drive_queued_at ON url_from_drive(queued_at);
+  `);
+  return db;
 }
 
 async function googleApiRequest<T = void>(
@@ -1030,50 +1218,31 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
   return text ? JSON.parse(text) as T : {} as T;
 }
 
-async function scrapeSingleUrl(
+async function scrapeAndWriteUrl(
   inputUrl: string,
-  options: Pick<CliOptions, "browser" | "connectUrl" | "dbFile" | "headless" | "outputDir">,
-  index = 1
-): Promise<ScrapeResult> {
+  options: Pick<CliOptions, "browser" | "connectUrl" | "headless" | "outputDir">,
+  index = 1,
+  existingOutputPath: string | null = null
+): Promise<{ outputPath: string; sourceUrl: string; }> {
   const outputDir = path.resolve(process.cwd(), options.outputDir);
-  const dbFile = path.resolve(process.cwd(), options.dbFile);
 
   await mkdir(outputDir, { recursive: true });
 
   const article = createSingleArticle(inputUrl);
   assertArticleUrl(article.sourceUrl);
   logInfo(`Normalized article URL: ${inputUrl} -> ${article.sourceUrl}`);
-  const db = openTrackingDatabase(dbFile);
-  const existingRecord = getScrapedUrlRecord(db, article.sourceUrl);
-
-  if (existingRecord) {
-    db.close();
-    return {
-      outputPath: existingRecord.outputPath,
-      sourceUrl: article.sourceUrl,
-      status: "skipped"
-    };
-  }
 
   logInfo(`Opening browser for article: ${article.sourceUrl}`);
   const { browser, context } = await openBrowserSession(options.browser, options.headless, options.connectUrl);
 
   try {
     const result = await extractArticleContent(context, article, outputDir, index);
-    const outputPath = await writeExtraction(outputDir, result, index);
-    upsertScrapedUrlRecord(db, {
-      outputPath,
-      scrapedAt: new Date().toISOString(),
-      sourceUrl: article.sourceUrl
-    });
-
+    const outputPath = await writeExtraction(outputDir, result, existingOutputPath);
     return {
       outputPath,
-      sourceUrl: article.sourceUrl,
-      status: "saved"
+      sourceUrl: article.sourceUrl
     };
   } finally {
-    db.close();
     await browser.close();
   }
 }
@@ -1102,6 +1271,68 @@ function getScrapedUrlRecord(db: DatabaseSync, sourceUrl: string): ScrapedUrlRec
     .get(sourceUrl) as ScrapedUrlRecord | undefined;
 
   return row ?? null;
+}
+
+function getAllScrapedUrlRecords(db: DatabaseSync): ScrapedUrlRecord[] {
+  return db
+    .prepare("SELECT source_url AS sourceUrl, output_path AS outputPath, scraped_at AS scrapedAt FROM scraped_urls ORDER BY scraped_at ASC, source_url ASC")
+    .all() as ScrapedUrlRecord[];
+}
+
+function getQueuedUrlRecord(db: DatabaseSync, sourceUrl: string): QueueUrlRecord | null {
+  const row = db
+    .prepare(`
+      SELECT
+        source_url AS sourceUrl,
+        drive_file_id AS driveFileId,
+        drive_file_name AS driveFileName,
+        queued_at AS queuedAt,
+        last_error AS lastError
+      FROM url_from_drive
+      WHERE source_url = ?
+    `)
+    .get(sourceUrl) as QueueUrlRecord | undefined;
+
+  return row ?? null;
+}
+
+function getAllQueuedUrlRecords(db: DatabaseSync): QueueUrlRecord[] {
+  return db
+    .prepare(`
+      SELECT
+        source_url AS sourceUrl,
+        drive_file_id AS driveFileId,
+        drive_file_name AS driveFileName,
+        queued_at AS queuedAt,
+        last_error AS lastError
+      FROM url_from_drive
+      ORDER BY queued_at ASC, source_url ASC
+    `)
+    .all() as QueueUrlRecord[];
+}
+
+function insertQueuedUrlRecord(db: DatabaseSync, record: QueueUrlRecord): void {
+  db
+    .prepare(`
+      INSERT INTO url_from_drive (source_url, drive_file_id, drive_file_name, queued_at, last_error)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(source_url) DO UPDATE SET
+        drive_file_id = excluded.drive_file_id,
+        drive_file_name = excluded.drive_file_name,
+        queued_at = excluded.queued_at,
+        last_error = excluded.last_error
+    `)
+    .run(record.sourceUrl, record.driveFileId, record.driveFileName, record.queuedAt, record.lastError);
+}
+
+function deleteQueuedUrlRecord(db: DatabaseSync, sourceUrl: string): void {
+  db.prepare("DELETE FROM url_from_drive WHERE source_url = ?").run(sourceUrl);
+}
+
+function updateQueuedUrlError(db: DatabaseSync, sourceUrl: string, lastError: string): void {
+  db
+    .prepare("UPDATE url_from_drive SET last_error = ? WHERE source_url = ?")
+    .run(lastError, sourceUrl);
 }
 
 function upsertScrapedUrlRecord(db: DatabaseSync, record: ScrapedUrlRecord): void {
@@ -1281,7 +1512,7 @@ function normalizeArticleUrl(inputUrl: string): string {
   try {
     parsed = new URL(inputUrl);
   } catch {
-    throw new Error(`Invalid --url value: ${inputUrl}`);
+    throw new Error(`Invalid article URL: ${inputUrl}`);
   }
 
   if (parsed.origin === new URL(TARGET_URL).origin) {
@@ -1318,14 +1549,25 @@ function deriveTitleFromUrl(articleUrl: string): string {
     .trim() || "article";
 }
 
-async function writeExtraction(outputDir: string, result: ExtractionResult, index: number): Promise<string> {
-  const safeName = `${String(index).padStart(3, "0")}-${slugify(result.article.title)}`;
-  const outputPath = path.join(outputDir, `${safeName}.txt`);
+async function writeExtraction(outputDir: string, result: ExtractionResult, existingOutputPath: string | null): Promise<string> {
+  const outputPath = buildStableOutputPath(outputDir, result.article.sourceUrl);
   const body = result.footerContent
     ? `${result.content}\n\n${result.footerContent}\n`
     : `${result.content}\n`;
   await writeFile(outputPath, body, "utf8");
+
+  const previousOutputPath = existingOutputPath ? path.resolve(existingOutputPath) : null;
+  if (previousOutputPath && previousOutputPath !== outputPath && existsSync(previousOutputPath)) {
+    await unlink(previousOutputPath).catch(() => undefined);
+  }
+
   return outputPath;
+}
+
+function buildStableOutputPath(outputDir: string, sourceUrl: string): string {
+  const slug = slugify(deriveTitleFromUrl(sourceUrl));
+  const hash = createHash("sha256").update(sourceUrl).digest("hex").slice(0, 12);
+  return path.join(outputDir, `${slug}-${hash}.txt`);
 }
 
 function slugify(value: string): string {
