@@ -4,6 +4,8 @@
 
 This project ingests Medium article URLs from a Google Drive inbox, stages them in a queue database, scrapes article content through Freedium, and stores the extracted text as `.txt` files in `data/output`.
 
+It also contains a separate local knowledge app that indexes those saved txt files into a retrieval database for agent usage.
+
 The project is intentionally manual-only.
 
 There is no always-running daemon or watcher loop.
@@ -14,6 +16,11 @@ The system has two explicit stages:
 
 1. `make ingest`
 2. `make scrape-queue`
+
+The knowledge flow is separate:
+
+1. `make index-corpus`
+2. `make query-corpus QUERY="..."`
 
 ### Stage 1: Ingest
 
@@ -67,6 +74,17 @@ Table:
 
 - `scraped_urls(source_url, output_path, scraped_at)`
 
+### `data/knowledge.db`
+
+This is the local retrieval database for agents.
+
+It is built only from:
+
+- `data/scraped-urls.db`
+- `data/output/*.txt`
+
+It must not read from Drive or queue DBs.
+
 ## Output File Rule
 
 One normalized URL must map to one stable `.txt` filename.
@@ -83,6 +101,9 @@ Primary commands:
 - `make ingest`
 - `make scrape-queue`
 - `make rescan`
+- `make index-corpus`
+- `make query-corpus QUERY="..."`
+- `make reset-index`
 - `make show-db`
 - `make reset-db`
 - `make clean-output`
@@ -103,6 +124,11 @@ Important values:
 - `GOOGLE_OAUTH_TOKEN_FILE`
 - `HEADLESS`
 - `CONNECT_URL`
+- `KNOWLEDGE_DB_FILE`
+- `EMBEDDING_MODEL`
+- `CHUNK_TARGET_TOKENS`
+- `CHUNK_OVERLAP_TOKENS`
+- `QUERY_TOP_K`
 
 ## Design Constraints
 
@@ -117,10 +143,17 @@ When changing this project, preserve these rules:
 7. Keep Drive parse failures separate from scrape failures:
    - parse failure => Drive failure folder
    - scrape failure => keep row in queue DB with `last_error`
+8. Keep retrieval logic separate from scraping logic.
+9. The knowledge app must only index from:
+   - `data/scraped-urls.db`
+   - `data/output/*.txt`
+10. Agents should retrieve through the knowledge CLI, not by browsing raw files manually.
+11. The knowledge app must use local embeddings only. Do not reintroduce a remote embedding API into the runtime path.
 
 ## Files To Know
 
 - `apps/scraper/src/index.ts`: main CLI, Drive ingest, queue scrape, OAuth, DB helpers, Freedium scraping
+- `apps/knowledge/src/index.ts`: corpus indexing, embeddings, local retrieval CLI
 - `packages/config/src/index.ts`: shared default config values
 - `Makefile`: user-facing commands
 - `.env.example`: environment template

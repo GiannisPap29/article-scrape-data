@@ -1,0 +1,19 @@
+{
+  "name": "@web-scrapper/knowledge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.7.3",
+    "@web-scrapper/config": "0.1.0",
+    "sqlite-vec": "^0.1.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.10",
+    "typescript": "^5.9.2"
+  }
+}
