@@ -22,11 +22,11 @@ Runtime settings are loaded from a root `.env` file.
 - Indexes saved article txt files into a local knowledge database for agent retrieval.
 - Supports local retrieval queries over the indexed corpus.
 
-## Workspace layout
+## Project layout
 
-- `apps/scraper`: manual Drive ingest and scraping CLI
-- `apps/knowledge`: corpus indexing and retrieval CLI
-- `packages/config`: shared defaults
+- `src/scraper`: manual Drive ingest and scraping CLI
+- `src/knowledge`: corpus indexing and retrieval CLI
+- `src/config`: shared defaults
 - `data/output`: extracted text files and debug artifacts
 - `data/url_from_drive.db`: staged URL queue from Drive
 - `data/scraped-urls.db`: SQLite history of scraped source URLs

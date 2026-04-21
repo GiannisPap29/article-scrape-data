@@ -1,4 +1,4 @@
-.PHONY: help install browsers build typecheck ingest scrape-queue rescan index-corpus query-corpus reset-index reset-db show-db clean-output
+.PHONY: help install browsers build typecheck ingest drive-to-database scrape-queue scrape-url-database rescan index-corpus query-corpus reset-index reset-db show-db clean-output
 
 ifneq (,$(wildcard .env))
 include .env
@@ -28,7 +28,7 @@ help:
 	'Project Setup:' \
 	'  make install                     Install npm dependencies' \
 	'  make browsers                    Install Playwright browsers' \
-	'  make build                       Build all workspaces' \
+	'  make build                       Build the TypeScript CLI' \
 	'  make typecheck                   Run TypeScript checks' \
 	'' \
 	'First Run / Create Databases:' \
@@ -79,9 +79,9 @@ build:
 typecheck:
 	npm run typecheck
 
-
-
 ## Stage 1: read Google Drive files and stage URLs into url_from_drive.db
+ingest: drive-to-database
+
 drive-to-database:
 	@if [ -z "$(DRIVE_FOLDER_ID)" ]; then \
 		echo 'Missing DRIVE_FOLDER_ID. Usage: make ingest DRIVE_FOLDER_ID="<google-drive-folder-id>"'; \
@@ -89,15 +89,11 @@ drive-to-database:
 	fi
 	npm run scrape -- --ingest-drive --browser="$(BROWSER)" $(if $(CONNECT_URL),--connectUrl="$(CONNECT_URL)",) --outputDir="$(OUTPUT_DIR)" --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)" --driveFolderId="$(DRIVE_FOLDER_ID)" $(if $(DRIVE_ARCHIVE_FOLDER_ID),--driveArchiveFolderId="$(DRIVE_ARCHIVE_FOLDER_ID)",) $(if $(DRIVE_FAILED_FOLDER_ID),--driveFailedFolderId="$(DRIVE_FAILED_FOLDER_ID)",) --oauthClientFile="$(GOOGLE_OAUTH_CLIENT_FILE)" --oauthTokenFile="$(GOOGLE_OAUTH_TOKEN_FILE)" $(if $(filter false,$(HEADLESS)),--headless=false,)
 
-
-
 ## Stage 2: read url_from_drive.db, scrape new URLs, save txt files, and promote into scraped-urls.db
+scrape-queue: scrape-url-database
+
 scrape-url-database:
 	npm run scrape -- --scrape-queue --browser="$(BROWSER)" $(if $(CONNECT_URL),--connectUrl="$(CONNECT_URL)",) --outputDir="$(OUTPUT_DIR)" --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)" $(if $(filter false,$(HEADLESS)),--headless=false,)
-
-
-
-
 
 ## Stage 3: read output txt files and build/update local knowledge.db embeddings
 index-corpus:
@@ -111,9 +107,8 @@ query-corpus:
 	fi
 	npm run knowledge -- --query-corpus --query="$(QUERY)" --knowledgeDbFile="$(KNOWLEDGE_DB_FILE)" --embeddingModel="$(EMBEDDING_MODEL)" --queryTopK="$(QUERY_TOP_K)"
 
-
-
-
+show-db:
+	npm run scrape -- --show-db --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)"
 
 ## !!! DANGEROUS: delete and rebuild only the local knowledge index database
 reset-index:

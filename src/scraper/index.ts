@@ -16,10 +16,10 @@ import {
   DEFAULT_URL_QUEUE_DB_FILE,
   GOOGLE_DRIVE_SCOPE,
   TARGET_URL
-} from "@web-scrapper/config";
+} from "../config/index.js";
 
 type BrowserName = "chrome" | "msedge" | "firefox" | "webkit";
-type Command = "ingest-drive" | "rescan-db" | "reset" | "scrape-queue";
+type Command = "ingest-drive" | "rescan-db" | "reset" | "scrape-queue" | "show-db";
 
 type CliOptions = {
   browser: BrowserName;
@@ -217,6 +217,11 @@ async function main(): Promise<void> {
     logInfo(`Queue scrape finished: totalQueued=${summary.totalQueued} saved=${summary.saved} removedAlreadyScraped=${summary.removedAlreadyScraped} failed=${summary.failed}`);
     return;
   }
+
+  if (options.command === "show-db") {
+    showDatabases(options);
+    return;
+  }
 }
 
 function loadDotEnv(filePath: string): void {
@@ -281,6 +286,11 @@ function parseCliArgs(args: string[]): CliOptions {
 
     if (arg === "--scrape-queue") {
       command = "scrape-queue";
+      continue;
+    }
+
+    if (arg === "--show-db") {
+      command = "show-db";
       continue;
     }
 
@@ -584,49 +594,79 @@ async function rescrapeTrackedUrls(
 ): Promise<{ failed: number; rescraped: number; saved: number; skipped: number; total: number; }> {
   const dbFile = path.resolve(process.cwd(), options.dbFile);
   const db = openTrackingDatabase(dbFile);
-  const records = getAllScrapedUrlRecords(db);
-  db.close();
 
-  if (records.length === 0) {
-    logInfo("DB rescan found no tracked URLs.");
-    return {
-      failed: 0,
-      rescraped: 0,
-      saved: 0,
-      skipped: 0,
-      total: 0
-    };
-  }
-
-  logInfo(`DB rescan queued ${records.length} tracked URL(s).`);
-  let failed = 0;
-  let rescraped = 0;
-  let skipped = 0;
-
-  for (const [index, record] of records.entries()) {
-    try {
-      logInfo(`DB rescan start: ${record.sourceUrl}`);
-      const result = await scrapeAndWriteUrl(record.sourceUrl, options, index + 1, record.outputPath);
-      upsertScrapedUrlRecord(db, {
-        outputPath: result.outputPath,
-        scrapedAt: new Date().toISOString(),
-        sourceUrl: result.sourceUrl
-      });
-      rescraped += 1;
-      logInfo(`DB rescan updated: ${result.sourceUrl} -> ${result.outputPath}`);
-    } catch (error) {
-      failed += 1;
-      logError(`DB rescan failed: ${record.sourceUrl}: ${error instanceof Error ? error.message : String(error)}`);
+  try {
+    const records = getAllScrapedUrlRecords(db);
+    if (records.length === 0) {
+      logInfo("DB rescan found no tracked URLs.");
+      return {
+        failed: 0,
+        rescraped: 0,
+        saved: 0,
+        skipped: 0,
+        total: 0
+      };
     }
-  }
 
-  return {
-    failed,
-    rescraped,
-    saved: rescraped,
-    skipped,
-    total: records.length
-  };
+    logInfo(`DB rescan queued ${records.length} tracked URL(s).`);
+    let failed = 0;
+    let rescraped = 0;
+    let skipped = 0;
+
+    for (const [index, record] of records.entries()) {
+      try {
+        logInfo(`DB rescan start: ${record.sourceUrl}`);
+        const result = await scrapeAndWriteUrl(record.sourceUrl, options, index + 1, record.outputPath);
+        upsertScrapedUrlRecord(db, {
+          outputPath: result.outputPath,
+          scrapedAt: new Date().toISOString(),
+          sourceUrl: result.sourceUrl
+        });
+        rescraped += 1;
+        logInfo(`DB rescan updated: ${result.sourceUrl} -> ${result.outputPath}`);
+      } catch (error) {
+        failed += 1;
+        logError(`DB rescan failed: ${record.sourceUrl}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    return {
+      failed,
+      rescraped,
+      saved: rescraped,
+      skipped,
+      total: records.length
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function showDatabases(options: Pick<CliOptions, "dbFile" | "queueDbFile">): void {
+  const dbFile = path.resolve(process.cwd(), options.dbFile);
+  const queueDbFile = path.resolve(process.cwd(), options.queueDbFile);
+  const scrapedDb = openTrackingDatabase(dbFile);
+  const queueDb = openQueueDatabase(queueDbFile);
+
+  try {
+    const scrapedRows = getAllScrapedUrlRecords(scrapedDb);
+    const queuedRows = getAllQueuedUrlRecords(queueDb);
+
+    console.log(`scraped_urls (${scrapedRows.length})`);
+    for (const row of scrapedRows) {
+      console.log(`${row.scrapedAt}\t${row.sourceUrl}\t${row.outputPath}`);
+    }
+
+    console.log("");
+    console.log(`url_from_drive (${queuedRows.length})`);
+    for (const row of queuedRows) {
+      const lastError = row.lastError ? `\tlast_error=${row.lastError}` : "";
+      console.log(`${row.queuedAt}\t${row.sourceUrl}\t${row.driveFileName} (${row.driveFileId})${lastError}`);
+    }
+  } finally {
+    queueDb.close();
+    scrapedDb.close();
+  }
 }
 
 async function getGoogleAccessSession(clientFile: string, tokenFile: string): Promise<GoogleOAuthToken> {

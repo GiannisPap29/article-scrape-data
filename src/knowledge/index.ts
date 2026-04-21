@@ -14,7 +14,7 @@ import {
   DEFAULT_KNOWLEDGE_DB_FILE,
   DEFAULT_OUTPUT_DIR,
   DEFAULT_QUERY_TOP_K
-} from "@web-scrapper/config";
+} from "../config/index.js";
 
 type Command = "index-corpus" | "query-corpus" | "reset-index";
 
@@ -286,7 +286,7 @@ async function indexCorpus(options: CliOptions): Promise<IndexSummary> {
     for (const record of records) {
       try {
         const outputPath = path.resolve(process.cwd(), record.outputPath);
-        if (!outputPath.startsWith(outputDir)) {
+        if (!isPathInsideDirectory(outputPath, outputDir)) {
           throw new Error(`Output path is outside OUTPUT_DIR: ${outputPath}`);
         }
 
@@ -393,6 +393,11 @@ function openKnowledgeDatabase(dbFile: string): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_chunks_source_url ON chunks(source_url);
   `);
   return db;
+}
+
+function isPathInsideDirectory(filePath: string, directoryPath: string): boolean {
+  const relativePath = path.relative(directoryPath, filePath);
+  return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
 }
 
 function getAllScrapedUrlRecords(db: DatabaseSync): ScrapedUrlRecord[] {

@@ -152,9 +152,9 @@ When changing this project, preserve these rules:
 
 ## Files To Know
 
-- `apps/scraper/src/index.ts`: main CLI, Drive ingest, queue scrape, OAuth, DB helpers, Freedium scraping
-- `apps/knowledge/src/index.ts`: corpus indexing, embeddings, local retrieval CLI
-- `packages/config/src/index.ts`: shared default config values
+- `src/scraper/index.ts`: main CLI, Drive ingest, queue scrape, OAuth, DB helpers, Freedium scraping
+- `src/knowledge/index.ts`: corpus indexing, embeddings, local retrieval CLI
+- `src/config/index.ts`: shared default config values
 - `Makefile`: user-facing commands
 - `.env.example`: environment template
 - `README.md`: user documentation
