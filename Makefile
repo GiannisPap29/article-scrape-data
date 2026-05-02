@@ -1,4 +1,4 @@
-.PHONY: help install browsers build typecheck ingest drive-to-database scrape-queue scrape-url-database rescan index-corpus query-corpus reset-index reset-db show-db clean-output
+.PHONY: help install browsers build typecheck ingest drive-to-database scrape-queue scrape-url-database backup-db rescan reset-db show-db clean-output
 
 ifneq (,$(wildcard .env))
 include .env
@@ -14,14 +14,10 @@ DRIVE_FOLDER_ID ?=
 DRIVE_ARCHIVE_FOLDER_ID ?=
 DRIVE_FAILED_FOLDER_ID ?=
 URL_QUEUE_DB_FILE ?= ./data/url_from_drive.db
-KNOWLEDGE_DB_FILE ?= ./data/knowledge.db
 GOOGLE_OAUTH_CLIENT_FILE ?= ./data/oauth/google-client.json
 GOOGLE_OAUTH_TOKEN_FILE ?= ./data/oauth/google-token.json
-EMBEDDING_MODEL ?= Xenova/all-MiniLM-L6-v2
-CHUNK_TARGET_TOKENS ?= 500
-CHUNK_OVERLAP_TOKENS ?= 100
-QUERY_TOP_K ?= 8
-QUERY ?=
+DRIVE_BACKUP_FOLDER_ID ?=
+DRIVE_BACKUP_FILE_NAME ?= scraped-urls.db
 
 help:
 	@printf '%s\n' \
@@ -31,20 +27,18 @@ help:
 	'  make build                       Build the TypeScript CLI' \
 	'  make typecheck                   Run TypeScript checks' \
 	'' \
-	'First Run / Create Databases:' \
+	'Main Flow:' \
 	'  make ingest                      Stage 1: read Drive files and create/update url_from_drive.db' \
 	'  make scrape-queue                Stage 2: read url_from_drive.db, compare/promote into scraped-urls.db, save txt files' \
-	'  make index-corpus                Stage 3: read output txt files and build/update knowledge.db embeddings' \
 	'' \
-	'Knowledge Retrieval:' \
-	'  make query-corpus QUERY="..."    Query the local knowledge index for agent context' \
+	'Backup:' \
+	'  make backup-db                   Upload scraped-urls.db to one Google Drive backup file' \
 	'' \
 	'Inspection:' \
 	'  make show-db                     Print scraped source URL database rows' \
 	'' \
 	'Dangerous Commands:' \
 	'  make rescan                      Re-scrape all tracked DB URLs and refresh output files' \
-	'  make reset-index                 Delete and rebuild the local knowledge index database' \
 	'  make reset-db                    Delete scraped source URL history' \
 	'  make clean-output                Delete generated output files' \
 	'' \
@@ -59,13 +53,10 @@ help:
 	'  DRIVE_ARCHIVE_FOLDER_ID=<google-drive-archive-folder-id>' \
 	'  DRIVE_FAILED_FOLDER_ID=<google-drive-failure-folder-id>' \
 	'  URL_QUEUE_DB_FILE=./data/url_from_drive.db' \
-	'  KNOWLEDGE_DB_FILE=./data/knowledge.db' \
 	'  GOOGLE_OAUTH_CLIENT_FILE=./data/oauth/google-client.json' \
 	'  GOOGLE_OAUTH_TOKEN_FILE=./data/oauth/google-token.json' \
-	'  EMBEDDING_MODEL=Xenova/all-MiniLM-L6-v2' \
-	'  CHUNK_TARGET_TOKENS=500' \
-	'  CHUNK_OVERLAP_TOKENS=100' \
-	'  QUERY_TOP_K=8'
+	'  DRIVE_BACKUP_FOLDER_ID=<google-drive-folder-id>' \
+	'  DRIVE_BACKUP_FILE_NAME=scraped-urls.db'
 
 install:
 	npm install
@@ -95,24 +86,15 @@ scrape-queue: scrape-url-database
 scrape-url-database:
 	npm run scrape -- --scrape-queue --browser="$(BROWSER)" $(if $(CONNECT_URL),--connectUrl="$(CONNECT_URL)",) --outputDir="$(OUTPUT_DIR)" --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)" $(if $(filter false,$(HEADLESS)),--headless=false,)
 
-## Stage 3: read output txt files and build/update local knowledge.db embeddings
-index-corpus:
-	npm run knowledge -- --index-corpus --scrapedDbFile="$(DB_FILE)" --outputDir="$(OUTPUT_DIR)" --knowledgeDbFile="$(KNOWLEDGE_DB_FILE)" --embeddingModel="$(EMBEDDING_MODEL)" --chunkTargetTokens="$(CHUNK_TARGET_TOKENS)" --chunkOverlapTokens="$(CHUNK_OVERLAP_TOKENS)"
-
-## Query knowledge.db for prompt-ready chunks
-query-corpus:
-	@if [ -z "$(QUERY)" ]; then \
-		echo 'Missing QUERY. Usage: make query-corpus QUERY="your question"'; \
+backup-db:
+	@if [ -z "$(DRIVE_BACKUP_FOLDER_ID)" ]; then \
+		echo 'Missing DRIVE_BACKUP_FOLDER_ID. Usage: make backup-db DRIVE_BACKUP_FOLDER_ID="<google-drive-folder-id>"'; \
 		exit 1; \
 	fi
-	npm run knowledge -- --query-corpus --query="$(QUERY)" --knowledgeDbFile="$(KNOWLEDGE_DB_FILE)" --embeddingModel="$(EMBEDDING_MODEL)" --queryTopK="$(QUERY_TOP_K)"
+	npm run scrape -- --backup-db --dbFile="$(DB_FILE)" --driveBackupFolderId="$(DRIVE_BACKUP_FOLDER_ID)" --driveBackupFileName="$(DRIVE_BACKUP_FILE_NAME)" --oauthClientFile="$(GOOGLE_OAUTH_CLIENT_FILE)" --oauthTokenFile="$(GOOGLE_OAUTH_TOKEN_FILE)"
 
 show-db:
 	npm run scrape -- --show-db --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)"
-
-## !!! DANGEROUS: delete and rebuild only the local knowledge index database
-reset-index:
-	npm run knowledge -- --reset-index --knowledgeDbFile="$(KNOWLEDGE_DB_FILE)"
 
 ## !!! DANGEROUS: re-scrape every URL already stored in scraped-urls.db and refresh output files
 rescan:

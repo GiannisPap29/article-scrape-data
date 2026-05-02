@@ -7,8 +7,8 @@ Medium article extraction through Freedium with a two-stage Google Drive queue.
 Runtime settings are loaded from a root `.env` file.
 
 - Copy `.env.example` to `.env`
-- keep `.env` local and untracked
-- commit `.env.example` to GitHub
+- Keep `.env` local and untracked
+- Commit `.env.example` to GitHub
 
 ## What it does
 
@@ -19,18 +19,14 @@ Runtime settings are loaded from a root `.env` file.
 - Moves failed Drive files into a failure folder.
 - Scrapes queued URLs through Freedium and stores extracted text in `data/output/`.
 - Promotes successful queue entries into `data/scraped-urls.db`.
-- Indexes saved article txt files into a local knowledge database for agent retrieval.
-- Supports local retrieval queries over the indexed corpus.
 
 ## Project layout
 
 - `src/scraper`: manual Drive ingest and scraping CLI
-- `src/knowledge`: corpus indexing and retrieval CLI
 - `src/config`: shared defaults
 - `data/output`: extracted text files and debug artifacts
 - `data/url_from_drive.db`: staged URL queue from Drive
 - `data/scraped-urls.db`: SQLite history of scraped source URLs
-- `data/knowledge.db`: local SQLite vector index for agent retrieval
 - `data/oauth/google-client.json`: Google OAuth desktop client credentials
 - `data/oauth/google-token.json`: stored OAuth access/refresh tokens
 
@@ -75,7 +71,7 @@ make build
 make typecheck
 ```
 
-### First run / create databases
+### Main flow
 
 Stage 1: read Drive files and create or update `data/url_from_drive.db`:
 
@@ -89,25 +85,28 @@ Stage 2: read `data/url_from_drive.db`, compare/promote into `data/scraped-urls.
 make scrape-queue
 ```
 
-Stage 3: read `data/output/*.txt` and build or update `data/knowledge.db`:
-
-```bash
-make index-corpus
-```
-
-### Knowledge retrieval
-
-Query the local knowledge index for prompt-ready chunks:
-
-```bash
-make query-corpus QUERY="How should I design authentication for a REST API?"
-```
-
 ### Inspection
 
 ```bash
 make show-db
 ```
+
+### Backup
+
+Upload `data/scraped-urls.db` to Google Drive and overwrite one backup file:
+
+```bash
+make backup-db
+```
+
+Set these in `.env` first:
+
+```bash
+DRIVE_BACKUP_FOLDER_ID=<google-drive-folder-id>
+DRIVE_BACKUP_FILE_NAME=scraped-urls.db
+```
+
+Each run replaces the same Google Drive file instead of creating timestamped copies.
 
 ### Dangerous commands
 
@@ -115,12 +114,6 @@ Re-scrape every URL already stored in `scraped-urls.db` and refresh the local `.
 
 ```bash
 make rescan
-```
-
-Delete and rebuild only the knowledge index:
-
-```bash
-make reset-index
 ```
 
 Delete the scraped URL history:
@@ -156,10 +149,10 @@ make scrape-queue CONNECT_URL="http://127.0.0.1:9222" HEADLESS=false
 
 The Drive workflow expects:
 
-- one exact watched folder ID via `DRIVE_FOLDER_ID` in `.env`
-- optional archive folder via `DRIVE_ARCHIVE_FOLDER_ID`
-- native Google Docs or plain text files
-- one Medium article URL per file body
+- One exact watched folder ID via `DRIVE_FOLDER_ID` in `.env`
+- Optional archive folder via `DRIVE_ARCHIVE_FOLDER_ID`
+- Native Google Docs or plain text files
+- One Medium article URL per file body
 
 Example file content:
 
@@ -204,7 +197,7 @@ On the first `make ingest` run:
 
 1. The app starts a temporary local callback server on `127.0.0.1`.
 2. It prints a Google authorization URL.
-3. Open that URL in your browser and approve access.
+3. It also attempts to open that URL in your default browser automatically.
 4. Google redirects back to the local callback.
 5. The app stores tokens in `data/oauth/google-token.json`.
 
@@ -221,13 +214,11 @@ After that, the app reuses the refresh token and should not require repeated log
 - `DRIVE_FOLDER_ID=<google-drive-folder-id>`
 - `DRIVE_ARCHIVE_FOLDER_ID=<google-drive-folder-id>`
 - `DRIVE_FAILED_FOLDER_ID=<google-drive-folder-id>`
+- `DRIVE_BACKUP_FOLDER_ID=<google-drive-folder-id>`
+- `DRIVE_BACKUP_FILE_NAME=scraped-urls.db`
 - `GOOGLE_OAUTH_CLIENT_FILE=./data/oauth/google-client.json`
 - `GOOGLE_OAUTH_TOKEN_FILE=./data/oauth/google-token.json`
-- `KNOWLEDGE_DB_FILE=./data/knowledge.db`
-- `EMBEDDING_MODEL=Xenova/all-MiniLM-L6-v2`
-- `CHUNK_TARGET_TOKENS=500`
-- `CHUNK_OVERLAP_TOKENS=100`
-- `QUERY_TOP_K=8`
+
 ## Notes
 
 - Each Drive file must contain exactly one direct article URL, not a Medium profile/feed/list URL.
@@ -235,10 +226,6 @@ After that, the app reuses the refresh token and should not require repeated log
 - The queue scrape stage processes queued URLs sequentially in `queued_at` ascending order.
 - `data/url_from_drive.db` is the durable staging queue.
 - `data/scraped-urls.db` is the final success history.
-- `data/knowledge.db` is the local retrieval database for agent context.
-- The knowledge app uses local embeddings. On first index/query run, the embedding model may be downloaded and cached locally.
-- `make index-corpus` incrementally indexes only new or changed txt files based on `source_url + content_hash`.
-- `make query-corpus` is the intended agent-facing retrieval entrypoint.
 - `make rescan` ignores the duplicate skip and re-scrapes every tracked `source_url` already stored in `data/scraped-urls.db`.
 - SQLite table: `scraped_urls(source_url, output_path, scraped_at)`.
 - `make reset-db` clears only SQLite history, not existing output files.

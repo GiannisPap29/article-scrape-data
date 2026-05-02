@@ -1,0 +1,4 @@
+ls -lh data/*.db
+du -h data/*.db
+sqlite3 data/scraped-urls.db 'SELECT COUNT(*) FROM scraped_urls;'
+sqlite3 data/url_from_drive.db 'SELECT COUNT(*) FROM url_from_drive;'

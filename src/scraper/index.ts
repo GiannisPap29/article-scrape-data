@@ -1,14 +1,17 @@
 import { createHash, randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { type AddressInfo } from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { chromium, firefox, webkit, type BrowserContext, type Page } from "@playwright/test";
 import {
+  DEFAULT_DRIVE_BACKUP_FILE_NAME,
   DEFAULT_DB_FILE,
   DEFAULT_GOOGLE_OAUTH_CLIENT_FILE,
   DEFAULT_GOOGLE_OAUTH_TOKEN_FILE,
@@ -19,13 +22,15 @@ import {
 } from "../config/index.js";
 
 type BrowserName = "chrome" | "msedge" | "firefox" | "webkit";
-type Command = "ingest-drive" | "rescan-db" | "reset" | "scrape-queue" | "show-db";
+type Command = "backup-db" | "ingest-drive" | "rescan-db" | "reset" | "scrape-queue" | "show-db";
 
 type CliOptions = {
   browser: BrowserName;
   command: Command;
   connectUrl: string | null;
   dbFile: string;
+  driveBackupFileName: string;
+  driveBackupFolderId: string | null;
   driveArchiveFolderId: string | null;
   driveFailedFolderId: string | null;
   driveFolderId: string | null;
@@ -51,6 +56,8 @@ type Article = {
   title: string;
   sourceUrl: string;
 };
+
+type DriveBackupOptions = Pick<CliOptions, "dbFile" | "driveBackupFileName" | "driveBackupFolderId" | "oauthClientFile" | "oauthTokenFile">;
 
 type DriveDocumentFile = {
   id: string;
@@ -189,6 +196,13 @@ const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
   "topics"
 ]);
 
+class GoogleOAuthRefreshRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GoogleOAuthRefreshRejectedError";
+  }
+}
+
 async function main(): Promise<void> {
   loadDotEnv(path.resolve(process.cwd(), ".env"));
   const options = parseCliArgs(process.argv.slice(2));
@@ -209,6 +223,12 @@ async function main(): Promise<void> {
   if (options.command === "ingest-drive") {
     const summary = await ingestDriveQueue(resolveDriveWorkerOptions(options));
     logInfo(`Drive ingest finished: totalFiles=${summary.totalFiles} queued=${summary.queued} skippedExisting=${summary.skippedExisting} skippedQueued=${summary.skippedQueued} archived=${summary.archived} movedToFailure=${summary.movedToFailure} failed=${summary.failed}`);
+    return;
+  }
+
+  if (options.command === "backup-db") {
+    const backupFileId = await backupTrackingDatabaseToDrive(options);
+    logInfo(`Drive backup finished: fileId=${backupFileId} fileName=${options.driveBackupFileName}`);
     return;
   }
 
@@ -263,6 +283,8 @@ function parseCliArgs(args: string[]): CliOptions {
   let outputDir = readEnv("OUTPUT_DIR") ?? DEFAULT_OUTPUT_DIR;
   let dbFile = readEnv("DB_FILE") ?? DEFAULT_DB_FILE;
   let queueDbFile = readEnv("URL_QUEUE_DB_FILE") ?? DEFAULT_URL_QUEUE_DB_FILE;
+  let driveBackupFolderId = readEnv("DRIVE_BACKUP_FOLDER_ID");
+  let driveBackupFileName = readEnv("DRIVE_BACKUP_FILE_NAME") ?? DEFAULT_DRIVE_BACKUP_FILE_NAME;
   let driveFolderId = readEnv("DRIVE_FOLDER_ID");
   let driveArchiveFolderId = readEnv("DRIVE_ARCHIVE_FOLDER_ID");
   let driveFailedFolderId = readEnv("DRIVE_FAILED_FOLDER_ID");
@@ -281,6 +303,11 @@ function parseCliArgs(args: string[]): CliOptions {
 
     if (arg === "--ingest-drive") {
       command = "ingest-drive";
+      continue;
+    }
+
+    if (arg === "--backup-db") {
+      command = "backup-db";
       continue;
     }
 
@@ -328,6 +355,16 @@ function parseCliArgs(args: string[]): CliOptions {
       continue;
     }
 
+    if (arg.startsWith("--driveBackupFolderId=")) {
+      driveBackupFolderId = requiredFlagValue(arg, "--driveBackupFolderId");
+      continue;
+    }
+
+    if (arg.startsWith("--driveBackupFileName=")) {
+      driveBackupFileName = requiredFlagValue(arg, "--driveBackupFileName");
+      continue;
+    }
+
     if (arg.startsWith("--driveFolderId=")) {
       driveFolderId = requiredFlagValue(arg, "--driveFolderId");
       continue;
@@ -360,6 +397,8 @@ function parseCliArgs(args: string[]): CliOptions {
     command,
     connectUrl,
     dbFile,
+    driveBackupFileName,
+    driveBackupFolderId,
     driveArchiveFolderId,
     driveFailedFolderId,
     driveFolderId,
@@ -526,6 +565,27 @@ async function ingestDriveQueue(options: DriveWorkerOptions): Promise<DriveInges
   }
 }
 
+async function backupTrackingDatabaseToDrive(options: DriveBackupOptions): Promise<string> {
+  if (!options.driveBackupFolderId) {
+    throw new Error("Missing DRIVE_BACKUP_FOLDER_ID or --driveBackupFolderId for Drive backup.");
+  }
+
+  const dbFile = path.resolve(process.cwd(), options.dbFile);
+  const oauthClientFile = path.resolve(process.cwd(), options.oauthClientFile);
+  const oauthTokenFile = path.resolve(process.cwd(), options.oauthTokenFile);
+  const session = await getGoogleAccessSession(oauthClientFile, oauthTokenFile);
+
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "web-scrapper-backup-"));
+  const tempBackupPath = path.join(tempDir, options.driveBackupFileName);
+
+  try {
+    createSQLiteBackup(dbFile, tempBackupPath);
+    return await uploadDriveBackupFile(session, options.driveBackupFolderId, options.driveBackupFileName, tempBackupPath);
+  } finally {
+    await rm(tempDir, { force: true, recursive: true }).catch(() => undefined);
+  }
+}
+
 async function scrapeQueuedUrls(
   options: Pick<CliOptions, "browser" | "connectUrl" | "dbFile" | "headless" | "outputDir" | "queueDbFile">
 ): Promise<QueueScrapeSummary> {
@@ -677,8 +737,18 @@ async function getGoogleAccessSession(clientFile: string, tokenFile: string): Pr
   }
 
   if (existingToken?.refreshToken) {
-    const refreshedToken = await refreshGoogleAccessToken(client, existingToken, tokenFile);
-    return refreshedToken;
+    try {
+      const refreshedToken = await refreshGoogleAccessToken(client, existingToken, tokenFile);
+      return refreshedToken;
+    } catch (error) {
+      if (!(error instanceof GoogleOAuthRefreshRejectedError)) {
+        throw error;
+      }
+
+      logWarn(`${error.message} Starting a new Google OAuth authorization flow.`);
+      await unlink(tokenFile).catch(() => undefined);
+      return authorizeGoogleAccess(client, tokenFile);
+    }
   }
 
   return authorizeGoogleAccess(client, tokenFile);
@@ -793,7 +863,12 @@ async function refreshGoogleAccessToken(
   }>(response);
 
   if (!response.ok || !payload.access_token || !payload.expires_in) {
-    throw new Error(`Failed to refresh Google OAuth token: ${payload.error_description ?? payload.error ?? response.statusText}`);
+    const message = payload.error_description ?? payload.error ?? response.statusText;
+    if (payload.error === "invalid_grant" || /expired|revoked/iu.test(message)) {
+      throw new GoogleOAuthRefreshRejectedError(`Failed to refresh Google OAuth token: ${message}`);
+    }
+
+    throw new Error(`Failed to refresh Google OAuth token: ${message}`);
   }
 
   const refreshedToken: GoogleOAuthToken = {
@@ -941,6 +1016,8 @@ async function waitForGoogleAuthorizationCode(
 
   logInfo("Google OAuth authorization required.");
   logInfo(`Open this URL in your browser, sign in, and approve access:\n${authUrl.toString()}`);
+  openExternalUrl(authUrl.toString());
+  logInfo(`Waiting up to ${Math.round(OAUTH_CALLBACK_TIMEOUT_MS / 60_000)} minutes for Google OAuth callback on ${redirectUri}`);
 
   const callbackResult = await Promise.race([
     callbackPromise,
@@ -964,6 +1041,36 @@ async function waitForGoogleAuthorizationCode(
     ...callbackResult,
     codeVerifier
   };
+}
+
+function openExternalUrl(url: string): void {
+  const opener = getUrlOpenerCommand();
+  if (!opener) {
+    return;
+  }
+
+  try {
+    const child = spawn(opener.command, [...opener.args, url], {
+      detached: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    logInfo("Opened Google OAuth authorization URL in your default browser.");
+  } catch (error) {
+    logWarn(`Could not open Google OAuth URL automatically: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function getUrlOpenerCommand(): { args: string[]; command: string; } | null {
+  if (process.platform === "darwin") {
+    return { args: [], command: "open" };
+  }
+
+  if (process.platform === "win32") {
+    return { args: ["/c", "start", ""], command: "cmd" };
+  }
+
+  return { args: [], command: "xdg-open" };
 }
 
 async function writeGoogleOAuthToken(tokenFile: string, token: GoogleOAuthToken): Promise<void> {
@@ -1206,6 +1313,101 @@ async function moveDriveFileToFolder(session: GoogleOAuthToken, fileId: string, 
   });
 }
 
+async function findDriveFileByName(session: GoogleOAuthToken, fileName: string, parentId: string): Promise<{ id: string; } | null> {
+  const url = new URL("https://www.googleapis.com/drive/v3/files");
+  url.searchParams.set("fields", "files(id)");
+  url.searchParams.set("includeItemsFromAllDrives", "true");
+  url.searchParams.set("pageSize", "1");
+  url.searchParams.set("q", `'${parentId}' in parents and name='${escapeDriveQueryValue(fileName)}' and trashed=false`);
+  url.searchParams.set("supportsAllDrives", "true");
+
+  const response = await googleApiRequest<{ files?: Array<{ id: string; }>; }>(session, url);
+  return response.files?.[0] ?? null;
+}
+
+async function uploadDriveBackupFile(
+  session: GoogleOAuthToken,
+  folderId: string,
+  fileName: string,
+  localFilePath: string
+): Promise<string> {
+  const fileBuffer = await readFile(localFilePath);
+  const existingFile = await findDriveFileByName(session, fileName, folderId);
+
+  if (existingFile) {
+    logInfo(`Updating existing Drive backup file: ${fileName} (${existingFile.id})`);
+    await uploadDriveFileContent(session, existingFile.id, fileBuffer);
+    return existingFile.id;
+  }
+
+  logInfo(`Creating Drive backup file: ${fileName} in folder ${folderId}`);
+  return createDriveBinaryFile(session, folderId, fileName, fileBuffer);
+}
+
+async function uploadDriveFileContent(session: GoogleOAuthToken, fileId: string, fileBuffer: Buffer): Promise<void> {
+  const bodyBytes = Uint8Array.from(fileBuffer);
+  const url = new URL(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}`);
+  url.searchParams.set("uploadType", "media");
+  url.searchParams.set("supportsAllDrives", "true");
+
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/octet-stream"
+    },
+    body: new Blob([bodyBytes], { type: "application/octet-stream" })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to update Drive backup file (${response.status}): ${text || response.statusText}`);
+  }
+}
+
+async function createDriveBinaryFile(
+  session: GoogleOAuthToken,
+  folderId: string,
+  fileName: string,
+  fileBuffer: Buffer
+): Promise<string> {
+  const fileBytes = Uint8Array.from(fileBuffer);
+  const boundary = `web-scrapper-${randomBytes(12).toString("hex")}`;
+  const metadata = JSON.stringify({
+    name: fileName,
+    parents: [folderId]
+  });
+  const prefix = Uint8Array.from(Buffer.from(
+    `--${boundary}\r\n` +
+    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
+    `${metadata}\r\n` +
+    `--${boundary}\r\n` +
+    "Content-Type: application/octet-stream\r\n\r\n",
+    "utf8"
+  ));
+  const suffix = Uint8Array.from(Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"));
+
+  const url = new URL("https://www.googleapis.com/upload/drive/v3/files");
+  url.searchParams.set("uploadType", "multipart");
+  url.searchParams.set("supportsAllDrives", "true");
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": `multipart/related; boundary=${boundary}`
+    },
+    body: new Blob([prefix, fileBytes, suffix], { type: `multipart/related; boundary=${boundary}` })
+  });
+
+  const payload = await parseJsonResponse<{ error?: { message?: string; }; id?: string; }>(response);
+  if (!response.ok || !payload.id) {
+    throw new Error(`Failed to create Drive backup file (${response.status}): ${payload.error?.message ?? response.statusText}`);
+  }
+
+  return payload.id;
+}
+
 function openQueueDatabase(queueDbFile: string): DatabaseSync {
   mkdirSyncLike(path.dirname(queueDbFile));
   const db = new DatabaseSync(queueDbFile);
@@ -1391,6 +1593,18 @@ function resetTrackingDatabase(dbFile: string): void {
   const db = openTrackingDatabase(dbFile);
   db.exec("DELETE FROM scraped_urls;");
   db.close();
+}
+
+function createSQLiteBackup(sourceDbFile: string, backupDbFile: string): void {
+  mkdirSyncLike(path.dirname(backupDbFile));
+  const sourceDb = openTrackingDatabase(sourceDbFile);
+
+  try {
+    const escapedPath = backupDbFile.replace(/'/g, "''");
+    sourceDb.exec(`VACUUM INTO '${escapedPath}';`);
+  } finally {
+    sourceDb.close();
+  }
 }
 
 function createSingleArticle(inputUrl: string): Article {

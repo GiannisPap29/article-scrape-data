@@ -6,14 +6,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "install:browsers": "npx playwright install chromium",
-    "knowledge": "npm run build && node --no-warnings --enable-source-maps dist/knowledge/index.js",
     "scrape": "npm run build && node --no-warnings --enable-source-maps dist/scraper/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@huggingface/transformers": "^3.7.3",
-    "@playwright/test": "^1.54.2",
-    "sqlite-vec": "^0.1.7"
+    "@playwright/test": "^1.54.2"
   },
   "devDependencies": {
     "@types/node": "^24.0.10",
