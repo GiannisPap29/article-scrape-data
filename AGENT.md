@@ -2,7 +2,7 @@
 
 ## Project Purpose
 
-This project ingests Medium article URLs from a Google Drive inbox, stages them in a queue database, scrapes article content through Freedium, and stores the extracted text as `.txt` files in `data/output`.
+This project ingests Medium article URLs from a Google Drive inbox, stages them in a queue database, scrapes article content through Freedium, and stores the extracted text plus metadata sidecars in `data/output`.
 
 The project is intentionally manual-only.
 
@@ -38,10 +38,11 @@ The system has two explicit stages:
 1. Reads queued URLs from `data/url_from_drive.db` oldest-first.
 2. For each URL, scrapes content through Freedium.
 3. Saves the article text into `data/output`.
-4. Only after the `.txt` file is written successfully:
+4. Saves a metadata sidecar JSON with the same basename into `data/output`.
+5. Only after the `.txt` and `.json` files are written successfully:
    - upserts the URL into `data/scraped-urls.db`
    - removes the row from `data/url_from_drive.db`
-5. If scraping fails:
+6. If scraping fails:
    - the row remains in `data/url_from_drive.db`
    - `last_error` is updated
 
@@ -61,19 +62,20 @@ Table:
 
 This is the final success history.
 
-A URL should appear here only after its text file has been saved successfully.
+A URL should appear here only after its text file and metadata sidecar have been saved successfully.
 
 Table:
 
-- `scraped_urls(source_url, output_path, scraped_at)`
+- `scraped_urls(source_url, output_path, scraped_at, doc_id, title, author, site_name, excerpt, metadata_path, content_hash, published_at, language, tags_json)`
 
 ## Output File Rule
 
-One normalized URL must map to one stable `.txt` filename.
+One normalized URL must map to one stable `.txt` filename and one stable `.json` sidecar path.
 
 Important invariant:
 
 - the same normalized URL must always reuse the same output path
+- the sidecar metadata path must share the same basename as the text file
 - no duplicate variant files like `slug-2.txt` or `slug-3.txt` should be created for the same URL
 
 ## Commands
@@ -116,11 +118,11 @@ When changing this project, preserve these rules:
 3. Do not move a queue row into `scraped-urls.db` before the output file is written successfully.
 4. Keep `scraped-urls.db` as final success history only.
 5. Keep `url_from_drive.db` as the retryable staging queue.
-6. Preserve the one-URL-to-one-stable-txt-file rule.
+6. Preserve the one-URL-to-one-stable-output rule for `.txt` and `.json`.
 7. Keep Drive parse failures separate from scrape failures:
    - parse failure => Drive failure folder
    - scrape failure => keep row in queue DB with `last_error`
-8. Do not reintroduce the removed knowledge/indexing pipeline unless explicitly requested.
+8. Keep metadata export producer-side only. Do not reintroduce local knowledge/indexing logic unless explicitly requested.
 
 ## Files To Know
 

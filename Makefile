@@ -1,4 +1,4 @@
-.PHONY: help install browsers build typecheck ingest drive-to-database scrape-queue scrape-url-database backup-db rescan reset-db show-db clean-output
+.PHONY: help install browsers build typecheck ingest scrape-queue backup-db rescan reset-db show-db clean-output
 
 ifneq (,$(wildcard .env))
 include .env
@@ -29,7 +29,7 @@ help:
 	'' \
 	'Main Flow:' \
 	'  make ingest                      Stage 1: read Drive files and create/update url_from_drive.db' \
-	'  make scrape-queue                Stage 2: read url_from_drive.db, compare/promote into scraped-urls.db, save txt files' \
+	'  make scrape-queue                Stage 2: read url_from_drive.db, compare/promote into scraped-urls.db, save txt/json files' \
 	'' \
 	'Backup:' \
 	'  make backup-db                   Upload scraped-urls.db to one Google Drive backup file' \
@@ -38,7 +38,7 @@ help:
 	'  make show-db                     Print scraped source URL database rows' \
 	'' \
 	'Dangerous Commands:' \
-	'  make rescan                      Re-scrape all tracked DB URLs and refresh output files' \
+	'  make rescan                      Re-scrape all tracked DB URLs and refresh txt/json output files' \
 	'  make reset-db                    Delete scraped source URL history' \
 	'  make clean-output                Delete generated output files' \
 	'' \
@@ -71,19 +71,15 @@ typecheck:
 	npm run typecheck
 
 ## Stage 1: read Google Drive files and stage URLs into url_from_drive.db
-ingest: drive-to-database
-
-drive-to-database:
+ingest:
 	@if [ -z "$(DRIVE_FOLDER_ID)" ]; then \
 		echo 'Missing DRIVE_FOLDER_ID. Usage: make ingest DRIVE_FOLDER_ID="<google-drive-folder-id>"'; \
 		exit 1; \
 	fi
 	npm run scrape -- --ingest-drive --browser="$(BROWSER)" $(if $(CONNECT_URL),--connectUrl="$(CONNECT_URL)",) --outputDir="$(OUTPUT_DIR)" --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)" --driveFolderId="$(DRIVE_FOLDER_ID)" $(if $(DRIVE_ARCHIVE_FOLDER_ID),--driveArchiveFolderId="$(DRIVE_ARCHIVE_FOLDER_ID)",) $(if $(DRIVE_FAILED_FOLDER_ID),--driveFailedFolderId="$(DRIVE_FAILED_FOLDER_ID)",) --oauthClientFile="$(GOOGLE_OAUTH_CLIENT_FILE)" --oauthTokenFile="$(GOOGLE_OAUTH_TOKEN_FILE)" $(if $(filter false,$(HEADLESS)),--headless=false,)
 
-## Stage 2: read url_from_drive.db, scrape new URLs, save txt files, and promote into scraped-urls.db
-scrape-queue: scrape-url-database
-
-scrape-url-database:
+## Stage 2: read url_from_drive.db, scrape new URLs, save txt/json files, and promote into scraped-urls.db
+scrape-queue:
 	npm run scrape -- --scrape-queue --browser="$(BROWSER)" $(if $(CONNECT_URL),--connectUrl="$(CONNECT_URL)",) --outputDir="$(OUTPUT_DIR)" --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)" $(if $(filter false,$(HEADLESS)),--headless=false,)
 
 backup-db:
@@ -106,4 +102,4 @@ reset-db:
 
 ## !!! DANGEROUS: permanently delete generated output files
 clean-output:
-	rm -f "$(OUTPUT_DIR)"/*.txt "$(OUTPUT_DIR)"/*.html "$(OUTPUT_DIR)"/*.png
+	rm -f "$(OUTPUT_DIR)"/*.txt "$(OUTPUT_DIR)"/*.json "$(OUTPUT_DIR)"/*.html "$(OUTPUT_DIR)"/*.png

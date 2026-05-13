@@ -53,6 +53,7 @@ type DriveWorkerOptions = {
 } & Pick<CliOptions, "browser" | "connectUrl" | "headless">;
 
 type Article = {
+  docId: string;
   title: string;
   sourceUrl: string;
 };
@@ -91,8 +92,14 @@ type DriveIngestSummary = {
 
 type ExtractionResult = {
   article: Article;
+  author: string | null;
   content: string;
-  footerContent: string | null;
+  excerpt: string | null;
+  language: string | null;
+  publishedAt: string | null;
+  siteName: string | null;
+  tags: string[];
+  title: string;
 };
 
 type GoogleDocument = {
@@ -123,9 +130,19 @@ type OAuthCallbackResult = {
 };
 
 type ScrapedUrlRecord = {
+  author: string | null;
+  contentHash: string | null;
+  docId: string | null;
+  excerpt: string | null;
+  language: string | null;
+  metadataPath: string | null;
   outputPath: string;
+  publishedAt: string | null;
   scrapedAt: string;
+  siteName: string | null;
   sourceUrl: string;
+  tagsJson: string | null;
+  title: string | null;
 };
 
 type QueueUrlRecord = {
@@ -141,6 +158,24 @@ type QueueScrapeSummary = {
   removedAlreadyScraped: number;
   saved: number;
   totalQueued: number;
+};
+
+type PersistedDocumentMetadata = {
+  author: string | null;
+  batchId: string;
+  contentHash: string;
+  docId: string;
+  excerpt: string | null;
+  language: string | null;
+  metadataPath: string;
+  outputPath: string;
+  publishedAt: string | null;
+  scraperMetadataVersion: number;
+  scrapedAt: string;
+  siteName: string | null;
+  sourceUrl: string;
+  tags: string[];
+  title: string;
 };
 
 type StructuralElement = {
@@ -194,6 +229,18 @@ const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
   "search",
   "tag",
   "topics"
+]);
+const SCRAPER_METADATA_VERSION = 2;
+const ARTICLE_UI_ARTIFACT_LINES = new Set([
+  "copy",
+  "copy link",
+  "follow",
+  "listen",
+  "more from medium",
+  "open in app",
+  "save",
+  "share",
+  "subscribe"
 ]);
 
 class GoogleOAuthRefreshRejectedError extends Error {
@@ -627,9 +674,19 @@ async function scrapeQueuedUrls(
 
         const result = await scrapeAndWriteUrl(record.sourceUrl, options, index + 1, null);
         upsertScrapedUrlRecord(scrapedDb, {
+          author: result.author,
+          contentHash: result.contentHash,
+          docId: result.docId,
+          excerpt: result.excerpt,
+          language: result.language,
+          metadataPath: result.metadataPath,
           outputPath: result.outputPath,
-          scrapedAt: new Date().toISOString(),
-          sourceUrl: result.sourceUrl
+          publishedAt: result.publishedAt,
+          scrapedAt: result.scrapedAt,
+          siteName: result.siteName,
+          sourceUrl: result.sourceUrl,
+          tagsJson: JSON.stringify(result.tags),
+          title: result.title
         });
         deleteQueuedUrlRecord(queueDb, record.sourceUrl);
         summary.saved += 1;
@@ -678,9 +735,19 @@ async function rescrapeTrackedUrls(
         logInfo(`DB rescan start: ${record.sourceUrl}`);
         const result = await scrapeAndWriteUrl(record.sourceUrl, options, index + 1, record.outputPath);
         upsertScrapedUrlRecord(db, {
+          author: result.author,
+          contentHash: result.contentHash,
+          docId: result.docId,
+          excerpt: result.excerpt,
+          language: result.language,
+          metadataPath: result.metadataPath,
           outputPath: result.outputPath,
-          scrapedAt: new Date().toISOString(),
-          sourceUrl: result.sourceUrl
+          publishedAt: result.publishedAt,
+          scrapedAt: result.scrapedAt,
+          siteName: result.siteName,
+          sourceUrl: result.sourceUrl,
+          tagsJson: JSON.stringify(result.tags),
+          title: result.title
         });
         rescraped += 1;
         logInfo(`DB rescan updated: ${result.sourceUrl} -> ${result.outputPath}`);
@@ -714,7 +781,9 @@ function showDatabases(options: Pick<CliOptions, "dbFile" | "queueDbFile">): voi
 
     console.log(`scraped_urls (${scrapedRows.length})`);
     for (const row of scrapedRows) {
-      console.log(`${row.scrapedAt}\t${row.sourceUrl}\t${row.outputPath}`);
+      console.log(
+        `${row.scrapedAt}\t${row.sourceUrl}\t${row.outputPath}\t${row.metadataPath ?? ""}\t${row.docId ?? ""}\t${row.contentHash ?? ""}`
+      );
     }
 
     console.log("");
@@ -844,13 +913,7 @@ async function refreshGoogleAccessToken(
     params.set("client_secret", client.clientSecret);
   }
 
-  const response = await fetch(client.tokenUri, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: params
-  });
+  const response = await postGoogleOAuthTokenRequest(client.tokenUri, params, "refresh");
 
   const payload = await parseJsonResponse<{
     access_token?: string;
@@ -897,13 +960,7 @@ async function authorizeGoogleAccess(client: GoogleOAuthClient, tokenFile: strin
     params.set("client_secret", client.clientSecret);
   }
 
-  const response = await fetch(client.tokenUri, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: params
-  });
+  const response = await postGoogleOAuthTokenRequest(client.tokenUri, params, "authorization_code");
 
   const payload = await parseJsonResponse<{
     access_token?: string;
@@ -933,6 +990,25 @@ async function authorizeGoogleAccess(client: GoogleOAuthClient, tokenFile: strin
 
   await writeGoogleOAuthToken(tokenFile, token);
   return token;
+}
+
+async function postGoogleOAuthTokenRequest(
+  tokenUri: string,
+  params: URLSearchParams,
+  grantType: "authorization_code" | "refresh"
+): Promise<Response> {
+  try {
+    return await fetch(tokenUri, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: params
+    });
+  } catch (error) {
+    const details = formatErrorWithCause(error);
+    throw new Error(`Google OAuth token request failed during ${grantType} exchange to ${tokenUri}: ${details}`);
+  }
 }
 
 async function waitForGoogleAuthorizationCode(
@@ -1465,7 +1541,7 @@ async function scrapeAndWriteUrl(
   options: Pick<CliOptions, "browser" | "connectUrl" | "headless" | "outputDir">,
   index = 1,
   existingOutputPath: string | null = null
-): Promise<{ outputPath: string; sourceUrl: string; }> {
+): Promise<PersistedDocumentMetadata> {
   const outputDir = path.resolve(process.cwd(), options.outputDir);
 
   await mkdir(outputDir, { recursive: true });
@@ -1479,11 +1555,7 @@ async function scrapeAndWriteUrl(
 
   try {
     const result = await extractArticleContent(context, article, outputDir, index);
-    const outputPath = await writeExtraction(outputDir, result, existingOutputPath);
-    return {
-      outputPath,
-      sourceUrl: article.sourceUrl
-    };
+    return writeExtraction(outputDir, result, existingOutputPath);
   } finally {
     await browser.close();
   }
@@ -1500,6 +1572,7 @@ function openTrackingDatabase(dbFile: string): DatabaseSync {
     );
     CREATE INDEX IF NOT EXISTS idx_scraped_urls_scraped_at ON scraped_urls(scraped_at);
   `);
+  ensureScrapedUrlsColumns(db);
   return db;
 }
 
@@ -1509,7 +1582,24 @@ function mkdirSyncLike(dirPath: string): void {
 
 function getScrapedUrlRecord(db: DatabaseSync, sourceUrl: string): ScrapedUrlRecord | null {
   const row = db
-    .prepare("SELECT source_url AS sourceUrl, output_path AS outputPath, scraped_at AS scrapedAt FROM scraped_urls WHERE source_url = ?")
+    .prepare(`
+      SELECT
+        source_url AS sourceUrl,
+        output_path AS outputPath,
+        scraped_at AS scrapedAt,
+        doc_id AS docId,
+        title AS title,
+        author AS author,
+        site_name AS siteName,
+        excerpt AS excerpt,
+        metadata_path AS metadataPath,
+        content_hash AS contentHash,
+        published_at AS publishedAt,
+        language AS language,
+        tags_json AS tagsJson
+      FROM scraped_urls
+      WHERE source_url = ?
+    `)
     .get(sourceUrl) as ScrapedUrlRecord | undefined;
 
   return row ?? null;
@@ -1517,7 +1607,24 @@ function getScrapedUrlRecord(db: DatabaseSync, sourceUrl: string): ScrapedUrlRec
 
 function getAllScrapedUrlRecords(db: DatabaseSync): ScrapedUrlRecord[] {
   return db
-    .prepare("SELECT source_url AS sourceUrl, output_path AS outputPath, scraped_at AS scrapedAt FROM scraped_urls ORDER BY scraped_at ASC, source_url ASC")
+    .prepare(`
+      SELECT
+        source_url AS sourceUrl,
+        output_path AS outputPath,
+        scraped_at AS scrapedAt,
+        doc_id AS docId,
+        title AS title,
+        author AS author,
+        site_name AS siteName,
+        excerpt AS excerpt,
+        metadata_path AS metadataPath,
+        content_hash AS contentHash,
+        published_at AS publishedAt,
+        language AS language,
+        tags_json AS tagsJson
+      FROM scraped_urls
+      ORDER BY scraped_at ASC, source_url ASC
+    `)
     .all() as ScrapedUrlRecord[];
 }
 
@@ -1580,19 +1687,80 @@ function updateQueuedUrlError(db: DatabaseSync, sourceUrl: string, lastError: st
 function upsertScrapedUrlRecord(db: DatabaseSync, record: ScrapedUrlRecord): void {
   db
     .prepare(`
-      INSERT INTO scraped_urls (source_url, output_path, scraped_at)
-      VALUES (?, ?, ?)
+      INSERT INTO scraped_urls (
+        source_url,
+        output_path,
+        scraped_at,
+        doc_id,
+        title,
+        author,
+        site_name,
+        excerpt,
+        metadata_path,
+        content_hash,
+        published_at,
+        language,
+        tags_json
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(source_url) DO UPDATE SET
         output_path = excluded.output_path,
-        scraped_at = excluded.scraped_at
+        scraped_at = excluded.scraped_at,
+        doc_id = excluded.doc_id,
+        title = excluded.title,
+        author = excluded.author,
+        site_name = excluded.site_name,
+        excerpt = excluded.excerpt,
+        metadata_path = excluded.metadata_path,
+        content_hash = excluded.content_hash,
+        published_at = excluded.published_at,
+        language = excluded.language,
+        tags_json = excluded.tags_json
     `)
-    .run(record.sourceUrl, record.outputPath, record.scrapedAt);
+    .run(
+      record.sourceUrl,
+      record.outputPath,
+      record.scrapedAt,
+      record.docId,
+      record.title,
+      record.author,
+      record.siteName,
+      record.excerpt,
+      record.metadataPath,
+      record.contentHash,
+      record.publishedAt,
+      record.language,
+      record.tagsJson
+    );
 }
 
 function resetTrackingDatabase(dbFile: string): void {
   const db = openTrackingDatabase(dbFile);
   db.exec("DELETE FROM scraped_urls;");
   db.close();
+}
+
+function ensureScrapedUrlsColumns(db: DatabaseSync): void {
+  const existingColumns = new Set(
+    (db.prepare("PRAGMA table_info(scraped_urls)").all() as Array<{ name: string; }>)
+      .map((column) => column.name)
+  );
+  const missingColumns = [
+    ["doc_id", "TEXT"],
+    ["title", "TEXT"],
+    ["author", "TEXT"],
+    ["site_name", "TEXT"],
+    ["excerpt", "TEXT"],
+    ["metadata_path", "TEXT"],
+    ["content_hash", "TEXT"],
+    ["published_at", "TEXT"],
+    ["language", "TEXT"],
+    ["tags_json", "TEXT"]
+  ].filter(([name]) => !existingColumns.has(name));
+
+  for (const [name, type] of missingColumns) {
+    db.exec(`ALTER TABLE scraped_urls ADD COLUMN ${name} ${type};`);
+  }
 }
 
 function createSQLiteBackup(sourceDbFile: string, backupDbFile: string): void {
@@ -1609,8 +1777,9 @@ function createSQLiteBackup(sourceDbFile: string, backupDbFile: string): void {
 
 function createSingleArticle(inputUrl: string): Article {
   const sourceUrl = normalizeArticleUrl(inputUrl);
+  const docId = createDocId(sourceUrl);
   const title = deriveTitleFromUrl(sourceUrl);
-  return { title, sourceUrl };
+  return { docId, title, sourceUrl };
 }
 
 function assertArticleUrl(sourceUrl: string): void {
@@ -1695,6 +1864,8 @@ async function extractArticleContent(
     const mainContent = page.locator(".main-content, main, article, .content").first();
     logInfo(`Freedium waiting for content: ${article.sourceUrl}`);
     await mainContent.waitFor({ state: "visible", timeout: 30000 });
+    const extractedTitle = await extractArticleTitle(page, article);
+    const metadataFields = await extractDocumentMetadata(page, extractedTitle);
     const footerContent = await page
       .locator(".flex.flex-wrap.gap-2.mt-5")
       .first()
@@ -1702,7 +1873,7 @@ async function extractArticleContent(
       .then((value) => normalizeText(value))
       .catch(() => null);
 
-    const content = normalizeText(await mainContent.innerText());
+    const content = cleanExtractedArticleText(normalizeText(await mainContent.innerText()), extractedTitle);
     if (!content) {
       throw new Error(`Empty content extracted for ${article.sourceUrl}`);
     }
@@ -1711,8 +1882,14 @@ async function extractArticleContent(
 
     return {
       article,
+      author: metadataFields.author,
       content,
-      footerContent
+      excerpt: metadataFields.excerpt,
+      language: metadataFields.language,
+      publishedAt: metadataFields.publishedAt,
+      siteName: metadataFields.siteName,
+      tags: extractTagsFromFooter(footerContent),
+      title: extractedTitle
     };
   } catch (error) {
     const safeName = `${String(index).padStart(3, "0")}-${slugify(article.title)}`;
@@ -1803,25 +1980,194 @@ function deriveTitleFromUrl(articleUrl: string): string {
     .trim() || "article";
 }
 
-async function writeExtraction(outputDir: string, result: ExtractionResult, existingOutputPath: string | null): Promise<string> {
+async function extractArticleTitle(page: Page, article: Article): Promise<string> {
+  const headingTitle = await page
+    .locator("h1")
+    .first()
+    .innerText()
+    .then((value) => normalizeTitle(value))
+    .catch(() => "");
+
+  if (headingTitle) {
+    return headingTitle;
+  }
+
+  const pageTitle = normalizeBrowserPageTitle(await page.title().catch(() => ""));
+  if (pageTitle) {
+    return pageTitle;
+  }
+
+  return toDisplayTitle(article.title);
+}
+
+async function extractDocumentMetadata(
+  page: Page,
+  title: string
+): Promise<{ author: string | null; excerpt: string | null; language: string | null; publishedAt: string | null; siteName: string | null; }> {
+  return page.evaluate((resolvedTitle) => {
+    const readMeta = (...selectors: string[]) => {
+      for (const selector of selectors) {
+        const element = document.querySelector<HTMLMetaElement>(selector);
+        const value = element?.content?.trim();
+        if (value) {
+          return value;
+        }
+      }
+      return null;
+    };
+
+    const language = document.documentElement.lang?.trim() || null;
+    const siteName = readMeta('meta[property="og:site_name"]', 'meta[name="application-name"]');
+    const author = readMeta('meta[name="author"]', 'meta[property="article:author"]');
+    const excerpt = readMeta('meta[name="description"]', 'meta[property="og:description"]');
+    const publishedAt = readMeta(
+      'meta[property="article:published_time"]',
+      'meta[name="article:published_time"]',
+      'meta[name="parsely-pub-date"]'
+    );
+
+    const normalizedExcerpt = excerpt?.trim() || null;
+    return {
+      author,
+      excerpt: normalizedExcerpt && normalizedExcerpt !== resolvedTitle ? normalizedExcerpt : null,
+      language,
+      publishedAt,
+      siteName
+    };
+  }, title);
+}
+
+function cleanExtractedArticleText(content: string, title: string): string {
+  const lines = content.split("\n");
+  const cleanedLines: string[] = [];
+  const normalizedTitle = normalizeComparisonText(title);
+  let titleSkipped = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      if (cleanedLines.at(-1) !== "") {
+        cleanedLines.push("");
+      }
+      continue;
+    }
+
+    const normalizedLine = normalizeComparisonText(line);
+    if (!titleSkipped && normalizedLine === normalizedTitle) {
+      titleSkipped = true;
+      continue;
+    }
+
+    if (ARTICLE_UI_ARTIFACT_LINES.has(normalizedLine)) {
+      continue;
+    }
+
+    if (normalizedLine === normalizeComparisonText(cleanedLines.at(-1) ?? "")) {
+      continue;
+    }
+
+    cleanedLines.push(line);
+  }
+
+  return normalizeText(cleanedLines.join("\n"));
+}
+
+function normalizeBrowserPageTitle(value: string): string {
+  const normalized = normalizeTitle(value);
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized
+    .replace(/\s*[|:-]\s*(medium|freedium).*$/iu, "")
+    .replace(/\s*[|:-]\s*by\s+.+$/iu, "")
+    .trim();
+}
+
+function normalizeTitle(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function toDisplayTitle(value: string): string {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => /^[a-z]/u.test(part) ? part[0].toUpperCase() + part.slice(1) : part)
+    .join(" ")
+    .trim() || "article";
+}
+
+function normalizeComparisonText(value: string): string {
+  return normalizeTitle(value).toLowerCase();
+}
+
+async function writeExtraction(
+  outputDir: string,
+  result: ExtractionResult,
+  existingOutputPath: string | null
+): Promise<PersistedDocumentMetadata> {
   const outputPath = buildStableOutputPath(outputDir, result.article.sourceUrl);
-  const body = result.footerContent
-    ? `${result.content}\n\n${result.footerContent}\n`
-    : `${result.content}\n`;
+  const metadataPath = buildMetadataPath(outputPath);
+  const body = `${result.content}\n`;
+  const scrapedAt = new Date().toISOString();
+  const batchId = scrapedAt.slice(0, 10);
+  const contentHash = createHash("sha256").update(body).digest("hex");
+  const metadata: PersistedDocumentMetadata = {
+    author: result.author,
+    batchId,
+    contentHash,
+    docId: result.article.docId,
+    excerpt: result.excerpt,
+    language: result.language,
+    metadataPath,
+    outputPath,
+    publishedAt: result.publishedAt,
+    scraperMetadataVersion: SCRAPER_METADATA_VERSION,
+    scrapedAt,
+    siteName: result.siteName,
+    sourceUrl: result.article.sourceUrl,
+    tags: result.tags,
+    title: result.title
+  };
+
   await writeFile(outputPath, body, "utf8");
+  await writeFile(metadataPath, JSON.stringify(metadata, null, 2), "utf8");
 
   const previousOutputPath = existingOutputPath ? path.resolve(existingOutputPath) : null;
   if (previousOutputPath && previousOutputPath !== outputPath && existsSync(previousOutputPath)) {
     await unlink(previousOutputPath).catch(() => undefined);
+    await unlink(buildMetadataPath(previousOutputPath)).catch(() => undefined);
   }
 
-  return outputPath;
+  return metadata;
 }
 
 function buildStableOutputPath(outputDir: string, sourceUrl: string): string {
   const slug = slugify(deriveTitleFromUrl(sourceUrl));
   const hash = createHash("sha256").update(sourceUrl).digest("hex").slice(0, 12);
   return path.join(outputDir, `${slug}-${hash}.txt`);
+}
+
+function buildMetadataPath(outputPath: string): string {
+  return outputPath.replace(/\.txt$/u, ".json");
+}
+
+function createDocId(sourceUrl: string): string {
+  return `doc_${createHash("sha256").update(sourceUrl).digest("hex").slice(0, 16)}`;
+}
+
+function extractTagsFromFooter(footerContent: string | null): string[] {
+  if (!footerContent) {
+    return [];
+  }
+
+  const tags = footerContent
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^#[\p{L}\p{N}_-]+$/u.test(line))
+    .map((line) => line.slice(1).toLowerCase());
+
+  return [...new Set(tags)];
 }
 
 function slugify(value: string): string {
@@ -1837,6 +2183,31 @@ function normalizeText(value: string): string {
     .replace(/\r\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function formatErrorWithCause(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  const cause = "cause" in error ? (error as Error & { cause?: unknown; }).cause : undefined;
+  if (!cause) {
+    return error.message;
+  }
+
+  if (cause instanceof Error) {
+    return `${error.message}; cause=${cause.name}: ${cause.message}`;
+  }
+
+  if (typeof cause === "object") {
+    try {
+      return `${error.message}; cause=${JSON.stringify(cause)}`;
+    } catch {
+      return `${error.message}; cause=[object]`;
+    }
+  }
+
+  return `${error.message}; cause=${String(cause)}`;
 }
 
 function logInfo(message: string): void {

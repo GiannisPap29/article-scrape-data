@@ -17,16 +17,16 @@ Runtime settings are loaded from a root `.env` file.
 - Skips URLs already present in `data/scraped-urls.db` or already present in the queue DB.
 - Moves ingested Drive files into an archive folder.
 - Moves failed Drive files into a failure folder.
-- Scrapes queued URLs through Freedium and stores extracted text in `data/output/`.
+- Scrapes queued URLs through Freedium and stores extracted text plus sidecar metadata in `data/output/`.
 - Promotes successful queue entries into `data/scraped-urls.db`.
 
 ## Project layout
 
 - `src/scraper`: manual Drive ingest and scraping CLI
 - `src/config`: shared defaults
-- `data/output`: extracted text files and debug artifacts
+- `data/output`: extracted text files, metadata sidecars, and debug artifacts
 - `data/url_from_drive.db`: staged URL queue from Drive
-- `data/scraped-urls.db`: SQLite history of scraped source URLs
+- `data/scraped-urls.db`: SQLite history of scraped source URLs and document metadata
 - `data/oauth/google-client.json`: Google OAuth desktop client credentials
 - `data/oauth/google-token.json`: stored OAuth access/refresh tokens
 
@@ -79,7 +79,7 @@ Stage 1: read Drive files and create or update `data/url_from_drive.db`:
 make ingest
 ```
 
-Stage 2: read `data/url_from_drive.db`, compare/promote into `data/scraped-urls.db`, and save local `.txt` files:
+Stage 2: read `data/url_from_drive.db`, compare/promote into `data/scraped-urls.db`, and save local `.txt` + `.json` files:
 
 ```bash
 make scrape-queue
@@ -110,7 +110,7 @@ Each run replaces the same Google Drive file instead of creating timestamped cop
 
 ### Dangerous commands
 
-Re-scrape every URL already stored in `scraped-urls.db` and refresh the local `.txt` output files:
+Re-scrape every URL already stored in `scraped-urls.db` and refresh the local `.txt` + `.json` output files:
 
 ```bash
 make rescan
@@ -180,7 +180,7 @@ For each queued URL in `data/url_from_drive.db`:
 1. Read queued rows oldest-first.
 2. If the URL is already in `data/scraped-urls.db`, remove it from the queue DB.
 3. If not, scrape it through Freedium.
-4. Save or refresh the local `.txt` file in `data/output/`.
+4. Save or refresh the local `.txt` file and matching `.json` metadata file in `data/output/`.
 5. Upsert the success row into `data/scraped-urls.db`.
 6. Delete the successful row from `data/url_from_drive.db`.
 7. On scrape failure, keep the row in `data/url_from_drive.db` and update `last_error`.
@@ -219,6 +219,39 @@ After that, the app reuses the refresh token and should not require repeated log
 - `GOOGLE_OAUTH_CLIENT_FILE=./data/oauth/google-client.json`
 - `GOOGLE_OAUTH_TOKEN_FILE=./data/oauth/google-token.json`
 
+## Output contract
+
+Each successful scrape now produces two files with the same basename in `data/output/`:
+
+- `<slug>-<hash>.txt`: clean article body only
+- `<slug>-<hash>.json`: structured metadata for downstream ingestion
+
+The metadata sidecar includes:
+
+- `docId`
+- `title`
+- `author`
+- `siteName`
+- `excerpt`
+- `sourceUrl`
+- `outputPath`
+- `metadataPath`
+- `scrapedAt`
+- `batchId`
+- `contentHash`
+- `tags`
+- `publishedAt`
+- `language`
+- `scraperMetadataVersion`
+
+If Freedium exposes trailing hashtag lines like `#golang`, `#programming`, or `#software`, the scraper stores them in `tags` and does not append them to the `.txt` body.
+
+The sidecar schema is versioned. `scraperMetadataVersion=2` means:
+
+- `title` is the extracted article title when available, with URL-derived fallback only if extraction fails
+- `contentHash` is computed from the final normalized `.txt` body
+- obvious UI artifacts such as standalone `Copy`, `Share`, or duplicate title lines are removed conservatively before writing the `.txt`
+
 ## Notes
 
 - Each Drive file must contain exactly one direct article URL, not a Medium profile/feed/list URL.
@@ -227,9 +260,9 @@ After that, the app reuses the refresh token and should not require repeated log
 - `data/url_from_drive.db` is the durable staging queue.
 - `data/scraped-urls.db` is the final success history.
 - `make rescan` ignores the duplicate skip and re-scrapes every tracked `source_url` already stored in `data/scraped-urls.db`.
-- SQLite table: `scraped_urls(source_url, output_path, scraped_at)`.
+- SQLite table: `scraped_urls(source_url, output_path, scraped_at, doc_id, title, author, site_name, excerpt, metadata_path, content_hash, published_at, language, tags_json)`.
 - `make reset-db` clears only SQLite history, not existing output files.
-- `make clean-output` removes local `.txt`, `.html`, and `.png` output artifacts.
+- `make clean-output` removes local `.txt`, `.json`, `.html`, and `.png` output artifacts.
 
 ## References
 
