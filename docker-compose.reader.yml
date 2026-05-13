@@ -1,0 +1,14 @@
+services:
+  reader:
+    build:
+      context: ./apps/reader
+    container_name: web-scrapper-reader
+    environment:
+      PORT: "3010"
+      READER_HOST: 0.0.0.0
+      READER_OUTPUT_DIR: /app/data/output
+    ports:
+      - "127.0.0.1:3010:3010"
+    restart: unless-stopped
+    volumes:
+      - ./data/output:/app/data/output:ro

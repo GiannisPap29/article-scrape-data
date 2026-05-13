@@ -7,6 +7,7 @@ This project ingests Medium article URLs from a Google Drive inbox, stages them 
 The repo is split into:
 
 - `apps/scraper`: TypeScript scraper app
+- `apps/reader`: local Node reader app
 - `apps/rag`: Python RAG app
 - `data`: shared runtime contract between them
 
@@ -90,6 +91,9 @@ Primary commands:
 
 - `make ingest`
 - `make scrape-queue`
+- `make reader`
+- `make reader-up`
+- `make reader-down`
 - `make backup-db`
 - `make rescan`
 - `make show-db`
@@ -134,6 +138,8 @@ When changing this project, preserve these rules:
 
 - `apps/scraper/src/scraper/index.ts`: main CLI, Drive ingest, queue scrape, OAuth, DB helpers, Freedium scraping
 - `apps/scraper/src/config/index.ts`: shared defaults
+- `apps/reader/src/server.js`: local reader UI over `data/output`
+- `apps/reader/Dockerfile`: always-on local container for the reader UI
 - `apps/rag/src/*.py`: sync, ingest, query, and Chroma inspection
 - `Makefile`: user-facing commands
 - `.env.example`: environment template

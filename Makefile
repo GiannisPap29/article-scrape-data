@@ -1,4 +1,4 @@
-.PHONY: help install browsers build typecheck ingest scrape-queue backup-db rescan reset-db show-db clean-output rag-venv rag-install rag-sync rag-ingest rag-reingest rag-sources rag-ask rag-chroma-count rag-chroma-peek rag-chroma-doc
+.PHONY: help install browsers build typecheck ingest scrape-queue backup-db rescan reset-db show-db clean-output reader reader-up reader-down reader-logs rag-venv rag-install rag-sync rag-ingest rag-reingest rag-sources rag-ask rag-chroma-count rag-chroma-peek rag-chroma-doc
 
 ROOT_DIR := $(CURDIR)
 
@@ -20,6 +20,9 @@ GOOGLE_OAUTH_CLIENT_FILE ?= $(ROOT_DIR)/data/oauth/google-client.json
 GOOGLE_OAUTH_TOKEN_FILE ?= $(ROOT_DIR)/data/oauth/google-token.json
 DRIVE_BACKUP_FOLDER_ID ?=
 DRIVE_BACKUP_FILE_NAME ?= scraped-urls.db
+READER_APP_DIR ?= $(ROOT_DIR)/apps/reader
+READER_PORT ?= 3010
+READER_COMPOSE_FILE ?= $(ROOT_DIR)/docker-compose.reader.yml
 SCRAPER_APP_DIR ?= $(ROOT_DIR)/apps/scraper
 RAG_APP_DIR ?= $(ROOT_DIR)/apps/rag
 RAG_SOURCE_DIR ?= $(ROOT_DIR)/data/output
@@ -38,6 +41,8 @@ DB_FILE := $(abspath $(DB_FILE))
 URL_QUEUE_DB_FILE := $(abspath $(URL_QUEUE_DB_FILE))
 GOOGLE_OAUTH_CLIENT_FILE := $(abspath $(GOOGLE_OAUTH_CLIENT_FILE))
 GOOGLE_OAUTH_TOKEN_FILE := $(abspath $(GOOGLE_OAUTH_TOKEN_FILE))
+READER_APP_DIR := $(abspath $(READER_APP_DIR))
+READER_COMPOSE_FILE := $(abspath $(READER_COMPOSE_FILE))
 SCRAPER_APP_DIR := $(abspath $(SCRAPER_APP_DIR))
 RAG_APP_DIR := $(abspath $(RAG_APP_DIR))
 RAG_SOURCE_DIR := $(abspath $(RAG_SOURCE_DIR))
@@ -56,6 +61,12 @@ help:
 	'' \
 	'Backup:' \
 	'  make backup-db                   Upload scraped-urls.db to one Google Drive backup file' \
+	'' \
+	'Reader:' \
+	'  make reader                      Run the local article reader UI server' \
+	'  make reader-up                   Start the reader container in the background' \
+	'  make reader-down                 Stop the reader container' \
+	'  make reader-logs                 Tail reader container logs' \
 	'' \
 	'RAG Flow:' \
 	'  make rag-venv                    Create a local Python virtualenv for the RAG app' \
@@ -90,6 +101,9 @@ help:
 	'  GOOGLE_OAUTH_TOKEN_FILE=$(CURDIR)/data/oauth/google-token.json' \
 	'  DRIVE_BACKUP_FOLDER_ID=<google-drive-folder-id>' \
 	'  DRIVE_BACKUP_FILE_NAME=scraped-urls.db' \
+	'  READER_APP_DIR=$(CURDIR)/apps/reader' \
+	'  READER_COMPOSE_FILE=$(CURDIR)/docker-compose.reader.yml' \
+	'  READER_PORT=3010' \
 	'  SCRAPER_APP_DIR=$(CURDIR)/apps/scraper' \
 	'  PYTHON=$(CURDIR)/venv/bin/python' \
 	'  RAG_APP_DIR=$(CURDIR)/apps/rag' \
@@ -127,6 +141,18 @@ backup-db:
 	fi
 	npm --prefix "$(SCRAPER_APP_DIR)" run scrape -- --backup-db --dbFile="$(DB_FILE)" --driveBackupFolderId="$(DRIVE_BACKUP_FOLDER_ID)" --driveBackupFileName="$(DRIVE_BACKUP_FILE_NAME)" --oauthClientFile="$(GOOGLE_OAUTH_CLIENT_FILE)" --oauthTokenFile="$(GOOGLE_OAUTH_TOKEN_FILE)"
 
+reader:
+	npm --prefix "$(READER_APP_DIR)" run dev -- --port="$(READER_PORT)"
+
+reader-up:
+	docker compose -f "$(READER_COMPOSE_FILE)" up -d --build
+
+reader-down:
+	docker compose -f "$(READER_COMPOSE_FILE)" down
+
+reader-logs:
+	docker compose -f "$(READER_COMPOSE_FILE)" logs -f reader
+
 show-db:
 	npm --prefix "$(SCRAPER_APP_DIR)" run scrape -- --show-db --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)"
 
@@ -157,9 +183,6 @@ rag-install:
 		python3 -m pip install --user --upgrade pip; \
 		python3 -m pip install --user -r "$(RAG_APP_DIR)/requirements.txt"; \
 	fi
-
-
-
 
 
 rag-sync:

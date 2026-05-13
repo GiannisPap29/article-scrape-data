@@ -93,6 +93,8 @@ type DriveIngestSummary = {
 type ExtractionResult = {
   article: Article;
   author: string | null;
+  authorBio: string | null;
+  authorUrl: string | null;
   content: string;
   excerpt: string | null;
   language: string | null;
@@ -162,6 +164,8 @@ type QueueScrapeSummary = {
 
 type PersistedDocumentMetadata = {
   author: string | null;
+  authorBio?: string | null;
+  authorUrl?: string | null;
   batchId: string;
   contentHash: string;
   docId: string;
@@ -1873,7 +1877,8 @@ async function extractArticleContent(
       .then((value) => normalizeText(value))
       .catch(() => null);
 
-    const content = cleanExtractedArticleText(normalizeText(await mainContent.innerText()), extractedTitle);
+    const structuredContent = await extractStructuredArticleContent(page);
+    const content = cleanExtractedArticleText(normalizeText(structuredContent), extractedTitle);
     if (!content) {
       throw new Error(`Empty content extracted for ${article.sourceUrl}`);
     }
@@ -1883,6 +1888,8 @@ async function extractArticleContent(
     return {
       article,
       author: metadataFields.author,
+      authorBio: metadataFields.authorBio,
+      authorUrl: metadataFields.authorUrl,
       content,
       excerpt: metadataFields.excerpt,
       language: metadataFields.language,
@@ -2003,7 +2010,15 @@ async function extractArticleTitle(page: Page, article: Article): Promise<string
 async function extractDocumentMetadata(
   page: Page,
   title: string
-): Promise<{ author: string | null; excerpt: string | null; language: string | null; publishedAt: string | null; siteName: string | null; }> {
+): Promise<{
+  author: string | null;
+  authorBio: string | null;
+  authorUrl: string | null;
+  excerpt: string | null;
+  language: string | null;
+  publishedAt: string | null;
+  siteName: string | null;
+}> {
   return page.evaluate((resolvedTitle) => {
     const readMeta = (...selectors: string[]) => {
       for (const selector of selectors) {
@@ -2016,9 +2031,64 @@ async function extractDocumentMetadata(
       return null;
     };
 
+    const normalize = (value: string | null | undefined) => {
+      const trimmed = value?.trim();
+      return trimmed ? trimmed : null;
+    };
+
+    const isLikelyAuthorHref = (href: string) => {
+      return /https?:\/\/medium\.com\/@/iu.test(href) || /https?:\/\/[^/]+\/@[\w.-]+/iu.test(href);
+    };
+
+    const findAuthorLink = () => {
+      const selectors = [
+        "main a[href]",
+        "article a[href]",
+        ".main-content a[href]",
+        "a[href]"
+      ];
+
+      for (const selector of selectors) {
+        const links = Array.from(document.querySelectorAll<HTMLAnchorElement>(selector));
+        for (const link of links) {
+          const href = normalize(link.href);
+          const text = normalize(link.textContent);
+          if (!href || !text) {
+            continue;
+          }
+          if (!isLikelyAuthorHref(href)) {
+            continue;
+          }
+
+          const normalizedText = text.toLowerCase();
+          if (
+            normalizedText === resolvedTitle.toLowerCase() ||
+            normalizedText === "follow" ||
+            normalizedText === "open in app" ||
+            normalizedText === "listen"
+          ) {
+            continue;
+          }
+
+          return {
+            author: text,
+            authorBio: normalize(link.getAttribute("title")),
+            authorUrl: href
+          };
+        }
+      }
+
+      return {
+        author: null,
+        authorBio: null,
+        authorUrl: null
+      };
+    };
+
     const language = document.documentElement.lang?.trim() || null;
     const siteName = readMeta('meta[property="og:site_name"]', 'meta[name="application-name"]');
-    const author = readMeta('meta[name="author"]', 'meta[property="article:author"]');
+    const metaAuthor = readMeta('meta[name="author"]', 'meta[property="article:author"]');
+    const authorLink = findAuthorLink();
     const excerpt = readMeta('meta[name="description"]', 'meta[property="og:description"]');
     const publishedAt = readMeta(
       'meta[property="article:published_time"]',
@@ -2028,7 +2098,9 @@ async function extractDocumentMetadata(
 
     const normalizedExcerpt = excerpt?.trim() || null;
     return {
-      author,
+      author: metaAuthor ?? authorLink.author,
+      authorBio: authorLink.authorBio,
+      authorUrl: authorLink.authorUrl,
       excerpt: normalizedExcerpt && normalizedExcerpt !== resolvedTitle ? normalizedExcerpt : null,
       language,
       publishedAt,
@@ -2037,13 +2109,165 @@ async function extractDocumentMetadata(
   }, title);
 }
 
+async function extractStructuredArticleContent(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const root = document.querySelector<HTMLElement>(".main-content, main, article, .content");
+    if (!root) {
+      return "";
+    }
+
+    const normalizeInline = (value: string) => value.replace(/\s+/g, " ").trim();
+    const getImageSource = (image: HTMLImageElement) =>
+      image.currentSrc ||
+      image.getAttribute("src") ||
+      image.getAttribute("data-src") ||
+      image.getAttribute("data-original") ||
+      "";
+
+    const blocks: string[] = [];
+
+    const pushBlock = (value: string) => {
+      const trimmed = value.trim();
+      if (trimmed) {
+        blocks.push(trimmed);
+      }
+    };
+
+    const serializeList = (element: HTMLElement, ordered: boolean) => {
+      const items = Array.from(element.querySelectorAll(":scope > li"));
+      const lines = items
+        .map((item, index) => {
+          const text = normalizeInline(item.textContent ?? "");
+          if (!text) {
+            return "";
+          }
+          return ordered ? `${index + 1}. ${text}` : `- ${text}`;
+        })
+        .filter(Boolean);
+      if (lines.length > 0) {
+        pushBlock(lines.join("\n"));
+      }
+    };
+
+    const walk = (element: Element) => {
+      const tag = element.tagName.toLowerCase();
+
+      if (tag === "pre") {
+        const code = element.textContent?.replace(/\r\n/g, "\n").replace(/\n+$/u, "").trimEnd();
+        if (code) {
+          pushBlock(`\`\`\`\n${code}\n\`\`\``);
+        }
+        return;
+      }
+
+      if (tag === "figure") {
+        const image = element.querySelector("img");
+        if (image) {
+          const src = getImageSource(image);
+          const alt = normalizeInline(image.getAttribute("alt") || "");
+          const caption = normalizeInline(element.querySelector("figcaption")?.textContent || "");
+          if (src) {
+            pushBlock(`![${alt}](${src})`);
+          }
+          if (caption) {
+            pushBlock(caption);
+          }
+          return;
+        }
+      }
+
+      if (tag === "img") {
+        const image = element as HTMLImageElement;
+        const src = getImageSource(image);
+        const alt = normalizeInline(image.getAttribute("alt") || "");
+        if (src) {
+          pushBlock(`![${alt}](${src})`);
+        }
+        return;
+      }
+
+      if (/^h[1-6]$/u.test(tag)) {
+        const text = normalizeInline(element.textContent ?? "");
+        if (text) {
+          pushBlock(text);
+        }
+        return;
+      }
+
+      if (tag === "p") {
+        const text = normalizeInline(element.textContent ?? "");
+        if (text) {
+          pushBlock(text);
+        }
+        return;
+      }
+
+      if (tag === "blockquote") {
+        const lines = (element.textContent ?? "")
+          .split("\n")
+          .map((line) => normalizeInline(line))
+          .filter(Boolean)
+          .map((line) => `> ${line}`);
+        if (lines.length > 0) {
+          pushBlock(lines.join("\n"));
+        }
+        return;
+      }
+
+      if (tag === "ul") {
+        serializeList(element as HTMLElement, false);
+        return;
+      }
+
+      if (tag === "ol") {
+        serializeList(element as HTMLElement, true);
+        return;
+      }
+
+      const children = Array.from(element.children);
+      if (children.length === 0) {
+        const text = normalizeInline(element.textContent ?? "");
+        if (text) {
+          pushBlock(text);
+        }
+        return;
+      }
+
+      for (const child of children) {
+        walk(child);
+      }
+    };
+
+    for (const child of Array.from(root.children)) {
+      walk(child);
+    }
+
+    return blocks.join("\n\n");
+  });
+}
+
 function cleanExtractedArticleText(content: string, title: string): string {
   const lines = content.split("\n");
   const cleanedLines: string[] = [];
   const normalizedTitle = normalizeComparisonText(title);
   let titleSkipped = false;
+  let inCodeBlock = false;
 
   for (const rawLine of lines) {
+    if (rawLine.trim() === "```") {
+      inCodeBlock = !inCodeBlock;
+      if (cleanedLines.at(-1) !== "") {
+        cleanedLines.push("");
+      }
+      cleanedLines.push("```");
+      continue;
+    }
+
+    if (inCodeBlock) {
+      cleanedLines.push(rawLine.replace(/\r$/u, ""));
+      continue;
+    }
+
     const line = rawLine.trim();
     if (!line) {
       if (cleanedLines.at(-1) !== "") {
@@ -2114,6 +2338,8 @@ async function writeExtraction(
   const contentHash = createHash("sha256").update(body).digest("hex");
   const metadata: PersistedDocumentMetadata = {
     author: result.author,
+    authorBio: result.authorBio,
+    authorUrl: result.authorUrl,
     batchId,
     contentHash,
     docId: result.article.docId,

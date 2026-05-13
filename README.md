@@ -4,15 +4,16 @@ Medium article extraction plus local RAG over the scraped corpus with Chroma and
 
 ## Structure
 
-This repo is split into two app folders plus one shared data contract:
+This repo is split into app folders plus one shared data contract:
 
 - `apps/scraper/`: standalone TypeScript scraper app
+- `apps/reader/`: standalone local Node reader app
 - `apps/rag/`: standalone Python RAG app
 - `data/output/`: scraped `.txt` files and `.json` sidecars; source of truth for documents
 - `data/state/`: RAG manifest state
 - `data/chroma/`: persisted Chroma database
 
-The scraper writes `data/output/`. The RAG app reads `data/output/` and builds the local vector store. That shared `data/` folder is the only contract between the two parts.
+The scraper writes `data/output/`. The reader app browses `data/output/` for human reading. The RAG app reads `data/output/` and builds the local vector store. That shared `data/` folder is the only contract between the apps.
 
 ## Setup
 
@@ -71,6 +72,39 @@ You also need:
 - Ollama running locally
 - a local Gemma model available in Ollama, defaulting to `gemma4:e4b`
 
+### Reader
+
+Run the local article reader UI:
+
+```bash
+make reader
+```
+
+Default address:
+
+```text
+http://127.0.0.1:3010
+```
+
+Run it as an always-on local container:
+
+```bash
+make reader-up
+```
+
+Container address:
+
+```text
+http://127.0.0.1:3010
+```
+
+Useful container commands:
+
+```bash
+make reader-logs
+make reader-down
+```
+
 ## Main Flows
 
 ### Scraper flow
@@ -113,6 +147,27 @@ Show retrieved source chunks without calling Gemma:
 make rag-sources QUESTION="best practices for go error handling"
 ```
 
+### Reader flow
+
+Run the local browser UI over the shared article corpus:
+
+```bash
+make reader
+```
+
+Or keep it running all the time through Docker:
+
+```bash
+make reader-up
+```
+
+The reader app provides:
+
+- search over title, excerpt, and tags
+- filters for tag, author, language, and source domain
+- sortable article library
+- full article reading pages sourced from local `.txt` files
+
 ## Commands
 
 ### Scraper
@@ -135,6 +190,13 @@ make rag-sources QUESTION="best practices for go error handling"
 - `make rag-chroma-count`
 - `make rag-chroma-peek PEEK=3`
 - `make rag-chroma-doc DOC_ID="doc_..."`
+
+### Reader
+
+- `make reader`
+- `make reader-up`
+- `make reader-logs`
+- `make reader-down`
 
 ## RAG Contract
 
@@ -164,6 +226,7 @@ Optional enrichment:
 ## Notes
 
 - `data/output/` should remain intact; it is the handoff point between scraper and RAG.
+- The reader container mounts `data/output/` read-only and does not modify article files.
 - `data/state/` and `data/chroma/` are generated local artifacts and are ignored by Git.
 - The default embedding model is `sentence-transformers/all-MiniLM-L6-v2`.
 - The first `rag-ingest` may download model assets if they are not cached yet.
