@@ -4,6 +4,12 @@
 
 This project ingests Medium article URLs from a Google Drive inbox, stages them in a queue database, scrapes article content through Freedium, and stores the extracted text plus metadata sidecars in `data/output`.
 
+The repo is split into:
+
+- `apps/scraper`: TypeScript scraper app
+- `apps/rag`: Python RAG app
+- `data`: shared runtime contract between them
+
 The project is intentionally manual-only.
 
 There is no always-running daemon or watcher loop.
@@ -122,12 +128,13 @@ When changing this project, preserve these rules:
 7. Keep Drive parse failures separate from scrape failures:
    - parse failure => Drive failure folder
    - scrape failure => keep row in queue DB with `last_error`
-8. Keep metadata export producer-side only. Do not reintroduce local knowledge/indexing logic unless explicitly requested.
+8. Keep metadata export producer-side only unless the task is explicitly about the RAG app.
 
 ## Files To Know
 
-- `src/scraper/index.ts`: main CLI, Drive ingest, queue scrape, OAuth, DB helpers, Freedium scraping
-- `src/config/index.ts`: shared defaults
+- `apps/scraper/src/scraper/index.ts`: main CLI, Drive ingest, queue scrape, OAuth, DB helpers, Freedium scraping
+- `apps/scraper/src/config/index.ts`: shared defaults
+- `apps/rag/src/*.py`: sync, ingest, query, and Chroma inspection
 - `Makefile`: user-facing commands
 - `.env.example`: environment template
 - `README.md`: user documentation

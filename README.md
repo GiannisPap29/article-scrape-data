@@ -1,223 +1,179 @@
 # web-scrapper
 
-Medium article extraction through Freedium with a two-stage Google Drive queue.
+Medium article extraction plus local RAG over the scraped corpus with Chroma and Gemma 4 through Ollama.
 
-## Configuration
+## Structure
 
-Runtime settings are loaded from a root `.env` file.
+This repo is split into two app folders plus one shared data contract:
 
-- Copy `.env.example` to `.env`
-- Keep `.env` local and untracked
-- Commit `.env.example` to GitHub
+- `apps/scraper/`: standalone TypeScript scraper app
+- `apps/rag/`: standalone Python RAG app
+- `data/output/`: scraped `.txt` files and `.json` sidecars; source of truth for documents
+- `data/state/`: RAG manifest state
+- `data/chroma/`: persisted Chroma database
 
-## What it does
-
-- Reads one exact Google Drive inbox folder for Google Docs or plain text files that contain one Medium article URL.
-- Enqueues new URLs into `data/url_from_drive.db`.
-- Skips URLs already present in `data/scraped-urls.db` or already present in the queue DB.
-- Moves ingested Drive files into an archive folder.
-- Moves failed Drive files into a failure folder.
-- Scrapes queued URLs through Freedium and stores extracted text plus sidecar metadata in `data/output/`.
-- Promotes successful queue entries into `data/scraped-urls.db`.
-
-## Project layout
-
-- `src/scraper`: manual Drive ingest and scraping CLI
-- `src/config`: shared defaults
-- `data/output`: extracted text files, metadata sidecars, and debug artifacts
-- `data/url_from_drive.db`: staged URL queue from Drive
-- `data/scraped-urls.db`: SQLite history of scraped source URLs and document metadata
-- `data/oauth/google-client.json`: Google OAuth desktop client credentials
-- `data/oauth/google-token.json`: stored OAuth access/refresh tokens
+The scraper writes `data/output/`. The RAG app reads `data/output/` and builds the local vector store. That shared `data/` folder is the only contract between the two parts.
 
 ## Setup
 
-1. Install dependencies:
+### Scraper
 
 ```bash
 make install
 make browsers
-```
-
-2. Copy the example config:
-
-```bash
 cp .env.example .env
 ```
 
-3. In Google Cloud:
+Google requirements:
 
 - Enable the Google Drive API
 - Enable the Google Docs API
 - Create an OAuth client of type `Desktop app`
-- Download the client JSON
+- Put the client JSON at `data/oauth/google-client.json`
 
-4. Put the OAuth client file at:
+### RAG
 
-```text
-data/oauth/google-client.json
-```
-
-Or pass a custom path through `GOOGLE_OAUTH_CLIENT_FILE`.
-
-## Commands
-
-### Project setup
+Install Ollama locally on Linux:
 
 ```bash
-make install
-make browsers
-make build
-make typecheck
+curl -fsSL https://ollama.com/install.sh | sh
+ollama -v
 ```
 
-### Main flow
+Start the local Ollama server:
 
-Stage 1: read Drive files and create or update `data/url_from_drive.db`:
+```bash
+ollama serve
+```
+
+In another terminal, pull the Gemma 4 E4B model used by this repo:
+
+```bash
+ollama pull gemma4:e4b
+```
+
+Create a Python environment and install the local RAG dependencies:
+
+```bash
+python3 -m venv venv
+./venv/bin/pip install --upgrade pip
+./venv/bin/pip install -r apps/rag/requirements.txt
+```
+
+If you want the core Python packages explicitly, they are:
+
+```bash
+./venv/bin/pip install chromadb ollama sentence-transformers
+```
+
+You also need:
+
+- Ollama running locally
+- a local Gemma model available in Ollama, defaulting to `gemma4:e4b`
+
+## Main Flows
+
+### Scraper flow
+
+Stage Drive URLs into the queue DB:
 
 ```bash
 make ingest
 ```
 
-Stage 2: read `data/url_from_drive.db`, compare/promote into `data/scraped-urls.db`, and save local `.txt` + `.json` files:
+Scrape the queued URLs and write `.txt` + `.json` output into `data/output/`:
 
 ```bash
 make scrape-queue
 ```
 
-### Inspection
+### RAG flow
+
+Sync scraper sidecars into the RAG manifest:
 
 ```bash
-make show-db
+make rag-sync
 ```
 
-### Backup
-
-Upload `data/scraped-urls.db` to Google Drive and overwrite one backup file:
+Chunk, embed, and store documents in Chroma:
 
 ```bash
-make backup-db
+make rag-ingest
 ```
 
-Set these in `.env` first:
+Ask Gemma against the local corpus:
 
 ```bash
-DRIVE_BACKUP_FOLDER_ID=<google-drive-folder-id>
-DRIVE_BACKUP_FILE_NAME=scraped-urls.db
+make rag-ask QUESTION="best practices for go error handling"
 ```
 
-Each run replaces the same Google Drive file instead of creating timestamped copies.
-
-### Dangerous commands
-
-Re-scrape every URL already stored in `scraped-urls.db` and refresh the local `.txt` + `.json` output files:
+Show retrieved source chunks without calling Gemma:
 
 ```bash
-make rescan
+make rag-sources QUESTION="best practices for go error handling"
 ```
 
-Delete the scraped URL history:
+## Commands
 
-```bash
-make reset-db
-```
+### Scraper
 
-Delete generated output files:
+- `make ingest`
+- `make scrape-queue`
+- `make show-db`
+- `make backup-db`
+- `make rescan`
+- `make reset-db`
+- `make clean-output`
 
-```bash
-make clean-output
-```
+### RAG
 
-### Optional browser modes
+- `make rag-sync`
+- `make rag-ingest`
+- `make rag-reingest`
+- `make rag-sources QUESTION="..."`
+- `make rag-ask QUESTION="..."`
+- `make rag-chroma-count`
+- `make rag-chroma-peek PEEK=3`
+- `make rag-chroma-doc DOC_ID="doc_..."`
 
-Run with a visible browser for Freedium extraction:
+## RAG Contract
 
-```bash
-make ingest HEADLESS=false
-make scrape-queue HEADLESS=false
-make rescan HEADLESS=false
-```
+The importer reads scraper `*.json` sidecars from `data/output/` and expects `scraperMetadataVersion == 2`.
 
-Attach to an existing Chrome/Edge DevTools session:
+Required fields:
 
-```bash
-google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/medium-debug
-make scrape-queue CONNECT_URL="http://127.0.0.1:9222" HEADLESS=false
-```
+- `docId`
+- `contentHash`
+- `sourceUrl`
+- `scrapedAt`
+- `title`
+- `tags`
+- `outputPath`
+- `metadataPath`
+- `batchId`
+- `scraperMetadataVersion`
 
-## Google Drive workflow
+Optional enrichment:
 
-The Drive workflow expects:
+- `author`
+- `siteName`
+- `excerpt`
+- `publishedAt`
+- `language`
 
-- One exact watched folder ID via `DRIVE_FOLDER_ID` in `.env`
-- Optional archive folder via `DRIVE_ARCHIVE_FOLDER_ID`
-- Native Google Docs or plain text files
-- One Medium article URL per file body
+## Notes
 
-Example file content:
+- `data/output/` should remain intact; it is the handoff point between scraper and RAG.
+- `data/state/` and `data/chroma/` are generated local artifacts and are ignored by Git.
+- The default embedding model is `sentence-transformers/all-MiniLM-L6-v2`.
+- The first `rag-ingest` may download model assets if they are not cached yet.
+- The default Ollama model is `gemma4:e4b`, configurable in `apps/rag/src/query.py`.
 
-```text
-Read “One of These Numbers Doesn’t Fit in Reality“ by Abhinav on Medium: https://codingplainenglish.medium.com/one-of-these-numbers-doesnt-fit-in-reality-749194f3dbf3
-```
+Official references:
 
-### Ingest stage
-
-For each supported file in the Drive inbox:
-
-1. Read the body through the Google Docs API for native docs, or download the text content for plain text files.
-2. Extract exactly one valid Medium/Freedium article URL.
-3. Check `data/scraped-urls.db`.
-4. Check `data/url_from_drive.db`.
-5. If already scraped, archive the Drive file and do not queue it.
-6. If already queued, archive the Drive file and do not queue it again.
-7. If new, insert it into `data/url_from_drive.db`, then archive the Drive file.
-8. If parsing fails, move the Drive file into the failure folder.
-
-### Queue scrape stage
-
-For each queued URL in `data/url_from_drive.db`:
-
-1. Read queued rows oldest-first.
-2. If the URL is already in `data/scraped-urls.db`, remove it from the queue DB.
-3. If not, scrape it through Freedium.
-4. Save or refresh the local `.txt` file and matching `.json` metadata file in `data/output/`.
-5. Upsert the success row into `data/scraped-urls.db`.
-6. Delete the successful row from `data/url_from_drive.db`.
-7. On scrape failure, keep the row in `data/url_from_drive.db` and update `last_error`.
-
-If `DRIVE_ARCHIVE_FOLDER_ID` is not set, the app creates or reuses a sibling folder named `<WATCHED_FOLDER_NAME>_ARCHIVED`.
-
-If `DRIVE_FAILED_FOLDER_ID` is not set, the app creates or reuses a sibling folder named `<WATCHED_FOLDER_NAME>_FAILED`.
-
-If the watched folder is empty, `make ingest` does nothing and exits cleanly.
-
-## First-time OAuth flow
-
-On the first `make ingest` run:
-
-1. The app starts a temporary local callback server on `127.0.0.1`.
-2. It prints a Google authorization URL.
-3. It also attempts to open that URL in your default browser automatically.
-4. Google redirects back to the local callback.
-5. The app stores tokens in `data/oauth/google-token.json`.
-
-After that, the app reuses the refresh token and should not require repeated login unless the token is revoked or expired.
-
-## Options
-
-- `BROWSER=chrome|msedge|firefox|webkit`
-- `CONNECT_URL=http://127.0.0.1:9222`
-- `HEADLESS=true|false`
-- `OUTPUT_DIR=./data/output`
-- `DB_FILE=./data/scraped-urls.db`
-- `URL_QUEUE_DB_FILE=./data/url_from_drive.db`
-- `DRIVE_FOLDER_ID=<google-drive-folder-id>`
-- `DRIVE_ARCHIVE_FOLDER_ID=<google-drive-folder-id>`
-- `DRIVE_FAILED_FOLDER_ID=<google-drive-folder-id>`
-- `DRIVE_BACKUP_FOLDER_ID=<google-drive-folder-id>`
-- `DRIVE_BACKUP_FILE_NAME=scraped-urls.db`
-- `GOOGLE_OAUTH_CLIENT_FILE=./data/oauth/google-client.json`
-- `GOOGLE_OAUTH_TOKEN_FILE=./data/oauth/google-token.json`
+- Ollama Linux install: https://docs.ollama.com/linux
+- Gemma 4 model library: https://ollama.com/library/gemma4
+- Chroma Python package: https://pypi.org/project/chromadb/
 
 ## Output contract
 
