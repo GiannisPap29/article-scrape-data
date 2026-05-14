@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 import chromadb
 from ollama import Client
@@ -22,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=4, help="Number of retrieved chunks.")
     parser.add_argument(
         "--ollama-host",
-        default="http://127.0.0.1:11434",
+        default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
         help="Ollama host URL.",
     )
     parser.add_argument("--sources-only", action="store_true", help="Print retrieved sources without calling Gemma.")

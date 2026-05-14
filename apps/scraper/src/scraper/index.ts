@@ -21,7 +21,7 @@ import {
   TARGET_URL
 } from "../config/index.js";
 
-type BrowserName = "chrome" | "msedge" | "firefox" | "webkit";
+type BrowserName = "chromium" | "chrome" | "msedge" | "firefox" | "webkit";
 type Command = "backup-db" | "ingest-drive" | "rescan-db" | "reset" | "scrape-queue" | "show-db";
 
 type CliOptions = {
@@ -90,6 +90,15 @@ type DriveIngestSummary = {
   totalFiles: number;
 };
 
+type FreediumMetadata = {
+  free: boolean | null;
+  publication: string | null;
+  publicationUrl: string | null;
+  rawPublishedText: string | null;
+  updatedAt: string | null;
+  url: string | null;
+};
+
 type ExtractionResult = {
   article: Article;
   author: string | null;
@@ -97,6 +106,7 @@ type ExtractionResult = {
   authorUrl: string | null;
   content: string;
   excerpt: string | null;
+  freedium: FreediumMetadata;
   language: string | null;
   publishedAt: string | null;
   siteName: string | null;
@@ -170,6 +180,7 @@ type PersistedDocumentMetadata = {
   contentHash: string;
   docId: string;
   excerpt: string | null;
+  freedium?: FreediumMetadata;
   language: string | null;
   metadataPath: string;
   outputPath: string;
@@ -234,7 +245,7 @@ const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
   "tag",
   "topics"
 ]);
-const SCRAPER_METADATA_VERSION = 2;
+const SCRAPER_METADATA_VERSION = 3;
 const ARTICLE_UI_ARTIFACT_LINES = new Set([
   "copy",
   "copy link",
@@ -379,7 +390,7 @@ function parseCliArgs(args: string[]): CliOptions {
 
     if (arg.startsWith("--browser=")) {
       const value = arg.slice("--browser=".length).trim();
-      if (value !== "chrome" && value !== "msedge" && value !== "firefox" && value !== "webkit") {
+      if (value !== "chromium" && value !== "chrome" && value !== "msedge" && value !== "firefox" && value !== "webkit") {
         throw new Error(`Invalid --browser value: ${arg}`);
       }
       browser = value;
@@ -1827,6 +1838,10 @@ async function openBrowserSession(browserName: BrowserName, headless: boolean, c
 }
 
 async function launchBrowser(browserName: BrowserName, headless: boolean) {
+  if (browserName === "chromium") {
+    return chromium.launch({ headless });
+  }
+
   if (browserName === "chrome") {
     return chromium.launch({ channel: "chrome", headless });
   }
@@ -1892,6 +1907,10 @@ async function extractArticleContent(
       authorUrl: metadataFields.authorUrl,
       content,
       excerpt: metadataFields.excerpt,
+      freedium: {
+        ...metadataFields.freedium,
+        url: page.url()
+      },
       language: metadataFields.language,
       publishedAt: metadataFields.publishedAt,
       siteName: metadataFields.siteName,
@@ -2015,6 +2034,7 @@ async function extractDocumentMetadata(
   authorBio: string | null;
   authorUrl: string | null;
   excerpt: string | null;
+  freedium: Omit<FreediumMetadata, "url">;
   language: string | null;
   publishedAt: string | null;
   siteName: string | null;
@@ -2034,6 +2054,15 @@ async function extractDocumentMetadata(
     const normalize = (value: string | null | undefined) => {
       const trimmed = value?.trim();
       return trimmed ? trimmed : null;
+    };
+
+    const parseDateLabel = (value: string | null) => {
+      if (!value) {
+        return null;
+      }
+
+      const match = value.match(/[A-Z][a-z]+ \d{1,2}, \d{4}/u);
+      return match ? match[0] : null;
     };
 
     const isLikelyAuthorHref = (href: string) => {
@@ -2064,6 +2093,7 @@ async function extractDocumentMetadata(
           if (
             normalizedText === resolvedTitle.toLowerCase() ||
             normalizedText === "follow" ||
+            normalizedText.includes("go to the original") ||
             normalizedText === "open in app" ||
             normalizedText === "listen"
           ) {
@@ -2085,16 +2115,42 @@ async function extractDocumentMetadata(
       };
     };
 
+    const extractFreediumMetadata = () => {
+      const infoRow = Array.from(document.querySelectorAll<HTMLElement>("div, section")).find((element) => {
+        const text = normalize(element.textContent);
+        return text ? /free:\s*(yes|no)/iu.test(text) && /[A-Z][a-z]+ \d{1,2}, \d{4}/u.test(text) : false;
+      });
+
+      const publicationLink = infoRow?.querySelector<HTMLAnchorElement>('a[href]:not([href*="/@"])');
+      const rawPublishedText = normalize(
+        Array.from(infoRow?.querySelectorAll("span") ?? [])
+          .map((span) => normalize(span.textContent))
+          .find((text) => text && /[A-Z][a-z]+ \d{1,2}, \d{4}/u.test(text))
+      );
+      const updatedMatch = rawPublishedText?.match(/\(Updated:\s*([^)]+)\)/iu);
+      const freeMatch = normalize(infoRow?.textContent)?.match(/free:\s*(yes|no)/iu);
+
+      return {
+        free: freeMatch ? freeMatch[1].toLowerCase() === "yes" : null,
+        publication: normalize(publicationLink?.textContent),
+        publicationUrl: normalize(publicationLink?.href),
+        rawPublishedText,
+        updatedAt: updatedMatch ? normalize(updatedMatch[1]) : null,
+        visiblePublishedAt: parseDateLabel(rawPublishedText)
+      };
+    };
+
     const language = document.documentElement.lang?.trim() || null;
     const siteName = readMeta('meta[property="og:site_name"]', 'meta[name="application-name"]');
     const metaAuthor = readMeta('meta[name="author"]', 'meta[property="article:author"]');
     const authorLink = findAuthorLink();
     const excerpt = readMeta('meta[name="description"]', 'meta[property="og:description"]');
+    const freedium = extractFreediumMetadata();
     const publishedAt = readMeta(
       'meta[property="article:published_time"]',
       'meta[name="article:published_time"]',
       'meta[name="parsely-pub-date"]'
-    );
+    ) ?? freedium.visiblePublishedAt;
 
     const normalizedExcerpt = excerpt?.trim() || null;
     return {
@@ -2102,6 +2158,13 @@ async function extractDocumentMetadata(
       authorBio: authorLink.authorBio,
       authorUrl: authorLink.authorUrl,
       excerpt: normalizedExcerpt && normalizedExcerpt !== resolvedTitle ? normalizedExcerpt : null,
+      freedium: {
+        free: freedium.free,
+        publication: freedium.publication,
+        publicationUrl: freedium.publicationUrl,
+        rawPublishedText: freedium.rawPublishedText,
+        updatedAt: freedium.updatedAt
+      },
       language,
       publishedAt,
       siteName
@@ -2344,6 +2407,7 @@ async function writeExtraction(
     contentHash,
     docId: result.article.docId,
     excerpt: result.excerpt,
+    freedium: result.freedium,
     language: result.language,
     metadataPath,
     outputPath,

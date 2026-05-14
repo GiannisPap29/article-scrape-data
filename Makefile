@@ -91,6 +91,7 @@ help:
 	'  OUTPUT_DIR=$(CURDIR)/data/output' \
 	'  DB_FILE=$(CURDIR)/data/scraped-urls.db' \
 	'  BROWSER=chrome|msedge|firefox|webkit' \
+	'  BROWSER=chrome|msedge|firefox|webkit' \
 	'  CONNECT_URL=http://127.0.0.1:9222' \
 	'  HEADLESS=true|false' \
 	'  DRIVE_FOLDER_ID=<google-drive-folder-id>' \

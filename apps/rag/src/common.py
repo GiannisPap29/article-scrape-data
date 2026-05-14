@@ -12,7 +12,7 @@ STATE_DIR = DATA_DIR / "state"
 CHROMA_DIR = DATA_DIR / "chroma"
 MANIFEST_PATH = STATE_DIR / "manifest.json"
 MANIFEST_SCHEMA_VERSION = 1
-SUPPORTED_SCRAPER_METADATA_VERSION = 2
+SUPPORTED_SCRAPER_METADATA_VERSIONS = {2, 3}
 DEFAULT_SCRAPER_OUTPUT_DIR = DATA_DIR / "output"
 
 REQUIRED_SIDECAR_FIELDS = {
@@ -102,10 +102,10 @@ def validate_sidecar(sidecar: dict[str, Any], sidecar_path: Path) -> None:
         raise ValueError(f"{sidecar_path} is missing required fields: {sorted(missing)}")
 
     version = sidecar.get("scraperMetadataVersion")
-    if version != SUPPORTED_SCRAPER_METADATA_VERSION:
+    if version not in SUPPORTED_SCRAPER_METADATA_VERSIONS:
         raise ValueError(
             f"{sidecar_path} has scraperMetadataVersion={version}; "
-            f"expected {SUPPORTED_SCRAPER_METADATA_VERSION}"
+            f"expected one of {sorted(SUPPORTED_SCRAPER_METADATA_VERSIONS)}"
         )
 
     if not isinstance(sidecar.get("tags"), list):

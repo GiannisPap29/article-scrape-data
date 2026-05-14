@@ -128,18 +128,19 @@ export async function loadArticles() {
     });
   }
 
-  articles.sort((left, right) => String(right.scrapedAt).localeCompare(String(left.scrapedAt)));
+  articles.sort((left, right) =>
+    String(right.publishedAt || right.scrapedAt).localeCompare(String(left.publishedAt || left.scrapedAt))
+  );
   return articles;
 }
 
 export function filterArticles(articles, query) {
-  const q = (query.q ?? "").trim().toLowerCase();
   const titleQuery = (query.title ?? "").trim().toLowerCase();
   const tag = (query.tag ?? "").trim();
   const author = (query.author ?? "").trim();
   const language = (query.language ?? "").trim();
   const domain = (query.domain ?? "").trim();
-  const sort = (query.sort ?? "newest").trim();
+  const sort = (query.sort ?? "published").trim();
 
   let filtered = articles.filter((article) => {
     if (titleQuery && !article.title.toLowerCase().includes(titleQuery)) {
@@ -157,40 +158,30 @@ export function filterArticles(articles, query) {
     if (domain && article.domain !== domain) {
       return false;
     }
-    if (!q) {
-      return true;
-    }
-
-    const haystack = [
-      article.title,
-      article.excerpt,
-      article.author,
-      article.language,
-      article.domain,
-      article.tags.join(" ")
-    ]
-      .join(" ")
-      .toLowerCase();
-
-    return haystack.includes(q);
+    return true;
   });
 
   if (sort === "oldest") {
-    filtered = filtered.sort((left, right) => String(left.scrapedAt).localeCompare(String(right.scrapedAt)));
+    filtered = filtered.sort((left, right) =>
+      String(left.publishedAt || left.scrapedAt).localeCompare(String(right.publishedAt || right.scrapedAt))
+    );
   } else if (sort === "title") {
     filtered = filtered.sort((left, right) => left.title.localeCompare(right.title));
   } else if (sort === "published") {
-    filtered = filtered.sort((left, right) => String(right.publishedAt).localeCompare(String(left.publishedAt)));
+    filtered = filtered.sort((left, right) =>
+      String(right.publishedAt || right.scrapedAt).localeCompare(String(left.publishedAt || left.scrapedAt))
+    );
   } else {
-    filtered = filtered.sort((left, right) => String(right.scrapedAt).localeCompare(String(left.scrapedAt)));
+    filtered = filtered.sort((left, right) =>
+      String(right.publishedAt || right.scrapedAt).localeCompare(String(left.publishedAt || left.scrapedAt))
+    );
   }
 
   return filtered;
 }
 
 function renderOptions(values, selectedValue, placeholder) {
-  const defaultLabel = selectedValue || placeholder;
-  const defaultOption = `<option value="">${escapeHtml(defaultLabel)}</option>`;
+  const defaultOption = placeholder ? `<option value="">${escapeHtml(placeholder)}</option>` : "";
   const items = values.map((value) => {
     const selected = value === selectedValue ? " selected" : "";
     return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(value)}</option>`;
@@ -200,7 +191,7 @@ function renderOptions(values, selectedValue, placeholder) {
 
 function renderRichBody(content) {
   if (!content.trim()) {
-    return '<p>Article body is missing.</p>';
+    return "<p>Article body is missing.</p>";
   }
 
   const lines = content.replace(/\r\n/g, "\n").split("\n");
@@ -553,8 +544,7 @@ export function renderIndex(articles, query) {
           return `<article class="card">
   <h3><a href="/article/${encodeURIComponent(article.docId)}">${escapeHtml(article.title)}</a></h3>
   <div class="meta">
-    <span>Scraped ${escapeHtml(formatDate(article.scrapedAt))}</span>
-    ${article.publishedAt ? `<span>Published ${escapeHtml(formatDate(article.publishedAt))}</span>` : ""}
+    <span>Published ${escapeHtml(formatDate(article.publishedAt || article.scrapedAt))}</span>
   </div>
   <div class="chips">${chips}${tagChips}</div>
   ${article.excerpt ? `<p class="excerpt">${escapeHtml(article.excerpt)}</p>` : ""}
@@ -578,8 +568,6 @@ export function renderIndex(articles, query) {
       <h2>Filters</h2>
       <label for="title">Title search</label>
       <input id="title" name="title" value="${escapeHtml(query.title ?? "")}" placeholder="Search article title">
-      <label for="q">Search title, excerpt, tags</label>
-      <input id="q" name="q" value="${escapeHtml(query.q ?? "")}" placeholder="Go, Kafka, architecture, retries">
       <label for="tag">Tag</label>
       <select id="tag" name="tag">${renderOptions(tags, query.tag ?? "", "All tags")}</select>
       <label for="author">Author</label>
@@ -589,7 +577,7 @@ export function renderIndex(articles, query) {
       <label for="domain">Source domain</label>
       <select id="domain" name="domain">${renderOptions(domains, query.domain ?? "", "All domains")}</select>
       <label for="sort">Sort</label>
-      <select id="sort" name="sort">${renderOptions(["newest", "oldest", "title", "published"], query.sort ?? "newest", "Newest")}</select>
+      <select id="sort" name="sort">${renderOptions(["published", "oldest", "title"], query.sort ?? "published", "Published")}</select>
       <div class="filter-actions">
         <button class="button" type="submit">Apply</button>
         <a class="button secondary" href="/">Reset</a>
@@ -628,8 +616,7 @@ export function renderArticle(article) {
   <section class="panel" style="padding: 1.25rem; margin-bottom: 1rem;">
     <h1>${escapeHtml(article.title)}</h1>
     <div class="meta">
-      <span>Scraped ${escapeHtml(formatDate(article.scrapedAt))}</span>
-      ${article.publishedAt ? `<span>Published ${escapeHtml(formatDate(article.publishedAt))}</span>` : ""}
+      <span>Published ${escapeHtml(formatDate(article.publishedAt || article.scrapedAt))}</span>
       <span>Stored at ${escapeHtml(path.basename(article.path))}</span>
     </div>
     <div class="chips">${chips}${tags}</div>

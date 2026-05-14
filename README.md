@@ -200,7 +200,7 @@ The reader app provides:
 
 ## RAG Contract
 
-The importer reads scraper `*.json` sidecars from `data/output/` and expects `scraperMetadataVersion == 2`.
+The importer reads scraper `*.json` sidecars from `data/output/` and currently accepts `scraperMetadataVersion == 2` or `3`.
 
 Required fields:
 
