@@ -94,6 +94,8 @@ def ingest_documents(collection_name: str, embed_model: str, limit: int | None, 
         ids = [f"{record['doc_id']}:chunk:{chunk_index}:{record['content_hash'][:12]}" for chunk_index in range(len(chunks))]
         metadatas = [build_chunk_metadata(record, chunk_index) for chunk_index in range(len(chunks))]
 
+        # Replace all chunks for this document atomically from the caller's
+        # perspective so stale chunks from an older content hash cannot linger.
         collection.delete(where={"doc_id": record["doc_id"]})
         collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
 

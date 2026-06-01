@@ -1,12 +1,18 @@
 .PHONY: help install browsers build typecheck ingest scrape-queue backup-db rescan reset-db show-db clean-output reader reader-up reader-down reader-logs rag-venv rag-install rag-sync rag-ingest rag-reingest rag-sources rag-ask rag-chroma-count rag-chroma-peek rag-chroma-doc
 
+# Default to the documented command index when make is run without a target.
+.DEFAULT_GOAL := help
+
 ROOT_DIR := $(CURDIR)
 
+# Root .env values can override any ?= defaults below.
 ifneq (,$(wildcard .env))
 include .env
 export
 endif
 
+# Shared scraper/reader/RAG paths. Keep these pointed at data/output unless
+# every app that consumes the scraper contract is updated together.
 OUTPUT_DIR ?= $(ROOT_DIR)/data/output
 DB_FILE ?= $(ROOT_DIR)/data/scraped-urls.db
 BROWSER ?= chrome
@@ -27,15 +33,26 @@ SCRAPER_APP_DIR ?= $(ROOT_DIR)/apps/scraper
 RAG_APP_DIR ?= $(ROOT_DIR)/apps/rag
 RAG_SOURCE_DIR ?= $(ROOT_DIR)/data/output
 QUESTION ?= best practices for go error handling
+RAG_MODEL ?= gemma3:1b
 PEEK ?= 3
 DOC_ID ?=
 
+ifneq (,$(filter rag-ask rag-sources,$(MAKECMDGOALS)))
+EXTRA_QUESTION_WORDS := $(filter-out rag-ask rag-sources,$(MAKECMDGOALS))
+ifneq (,$(strip $(EXTRA_QUESTION_WORDS)))
+override QUESTION := $(EXTRA_QUESTION_WORDS)
+endif
+endif
+
+# Prefer the project venv for Python RAG commands when it exists.
 ifneq (,$(wildcard $(ROOT_DIR)/venv/bin/python))
 PYTHON ?= $(ROOT_DIR)/venv/bin/python
 else
 PYTHON ?= python3
 endif
 
+# Normalize paths early so scripts receive stable absolute locations even when
+# variables are supplied from .env or the make command line.
 OUTPUT_DIR := $(abspath $(OUTPUT_DIR))
 DB_FILE := $(abspath $(DB_FILE))
 URL_QUEUE_DB_FILE := $(abspath $(URL_QUEUE_DB_FILE))
@@ -73,7 +90,8 @@ help:
 	'  make rag-install                 Install Python dependencies for the RAG app' \
 	'  make rag-sync                    Sync data/output metadata into data/state/manifest.json' \
 	'  make rag-ingest                  Chunk and embed synced docs into Chroma' \
-	'  make rag-ask QUESTION="..."      Query Chroma and ask local Gemma through Ollama' \
+	'  make rag-ask QUESTION="..."      Query Chroma and ask local Ollama through RAG_MODEL' \
+	'  make rag-ask "..."               Same as above, shorthand question form' \
 	'' \
 	'Inspection:' \
 	'  make show-db                     Print scraped source URL database rows' \
@@ -90,7 +108,6 @@ help:
 	'  .env file supported at repo root' \
 	'  OUTPUT_DIR=$(CURDIR)/data/output' \
 	'  DB_FILE=$(CURDIR)/data/scraped-urls.db' \
-	'  BROWSER=chrome|msedge|firefox|webkit' \
 	'  BROWSER=chrome|msedge|firefox|webkit' \
 	'  CONNECT_URL=http://127.0.0.1:9222' \
 	'  HEADLESS=true|false' \
@@ -109,17 +126,22 @@ help:
 	'  PYTHON=$(CURDIR)/venv/bin/python' \
 	'  RAG_APP_DIR=$(CURDIR)/apps/rag' \
 	'  RAG_SOURCE_DIR=$(CURDIR)/data/output' \
-	'  QUESTION=best practices for go error handling'
+	'  QUESTION=best practices for go error handling' \
+	'  RAG_MODEL=gemma3:1b'
 
+## Install scraper dependencies from apps/scraper/package-lock.json.
 install:
 	npm --prefix "$(SCRAPER_APP_DIR)" install
 
+## Install the Playwright browser used by the scraper.
 browsers:
 	npm --prefix "$(SCRAPER_APP_DIR)" run install:browsers
 
+## Compile the TypeScript scraper CLI into apps/scraper/dist.
 build:
 	npm --prefix "$(SCRAPER_APP_DIR)" run build
 
+## Run TypeScript checks without emitting compiled files.
 typecheck:
 	npm --prefix "$(SCRAPER_APP_DIR)" run typecheck
 
@@ -142,18 +164,23 @@ backup-db:
 	fi
 	npm --prefix "$(SCRAPER_APP_DIR)" run scrape -- --backup-db --dbFile="$(DB_FILE)" --driveBackupFolderId="$(DRIVE_BACKUP_FOLDER_ID)" --driveBackupFileName="$(DRIVE_BACKUP_FILE_NAME)" --oauthClientFile="$(GOOGLE_OAUTH_CLIENT_FILE)" --oauthTokenFile="$(GOOGLE_OAUTH_TOKEN_FILE)"
 
+## Start the reader UI directly with Node on READER_PORT.
 reader:
 	npm --prefix "$(READER_APP_DIR)" run dev -- --port="$(READER_PORT)"
 
+## Build and start the reader UI container in the background.
 reader-up:
 	docker compose -f "$(READER_COMPOSE_FILE)" up -d --build
 
+## Stop and remove the reader UI container.
 reader-down:
 	docker compose -f "$(READER_COMPOSE_FILE)" down
 
+## Tail logs from the reader UI container.
 reader-logs:
 	docker compose -f "$(READER_COMPOSE_FILE)" logs -f reader
 
+## Print scraped history and the retryable Drive URL queue.
 show-db:
 	npm --prefix "$(SCRAPER_APP_DIR)" run scrape -- --show-db --dbFile="$(DB_FILE)" --queueDbFile="$(URL_QUEUE_DB_FILE)"
 
@@ -170,12 +197,11 @@ clean-output:
 	rm -f "$(OUTPUT_DIR)"/*.txt "$(OUTPUT_DIR)"/*.json "$(OUTPUT_DIR)"/*.html "$(OUTPUT_DIR)"/*.png
 
 
-
-
-
+## Create the Python virtualenv used by the RAG commands.
 rag-venv:
 	python3 -m venv "$(ROOT_DIR)/venv"
 
+## Install or update Python dependencies for local Chroma/Gemma RAG.
 rag-install:
 	@if [ -x "$(ROOT_DIR)/venv/bin/python" ]; then \
 		"$(ROOT_DIR)/venv/bin/python" -m pip install --upgrade pip; \
@@ -185,27 +211,43 @@ rag-install:
 		python3 -m pip install --user -r "$(RAG_APP_DIR)/requirements.txt"; \
 	fi
 
-
+## Sync scraper JSON sidecars into data/state/manifest.json.
 rag-sync:
 	$(PYTHON) "$(RAG_APP_DIR)/src/sync.py" --source-dir "$(RAG_SOURCE_DIR)"
 
+## Chunk synced documents, embed them, and upsert chunks into Chroma.
 rag-ingest:
 	$(PYTHON) "$(RAG_APP_DIR)/src/ingest.py"
 
+## Force Chroma re-indexing even when content hashes are unchanged.
 rag-reingest:
 	$(PYTHON) "$(RAG_APP_DIR)/src/ingest.py" --force
 
+## Retrieve source chunks only; skips the Ollama/Gemma generation call.
 rag-sources:
 	$(PYTHON) "$(RAG_APP_DIR)/src/query.py" "$(QUESTION)" --sources-only
 
+## Ask a local Ollama model using Chroma retrieval context.
 rag-ask:
-	$(PYTHON) "$(RAG_APP_DIR)/src/query.py" "$(QUESTION)"
+	$(PYTHON) "$(RAG_APP_DIR)/src/query.py" "$(QUESTION)" --model "$(RAG_MODEL)"
 
+ifneq (,$(filter rag-ask rag-sources,$(MAKECMDGOALS)))
+%:
+	@:
+endif
+
+## Count all stored chunks in the default Chroma collection.
 rag-chroma-count:
 	$(PYTHON) "$(RAG_APP_DIR)/src/chroma_inspect.py" count
 
+## Print a small sample of records from the Chroma collection.
 rag-chroma-peek:
 	$(PYTHON) "$(RAG_APP_DIR)/src/chroma_inspect.py" peek --limit "$(PEEK)"
 
+## Print all chunks associated with one manifest doc id.
 rag-chroma-doc:
+	@if [ -z "$(DOC_ID)" ]; then \
+		echo 'Missing DOC_ID. Usage: make rag-chroma-doc DOC_ID="doc_..."'; \
+		exit 1; \
+	fi
 	$(PYTHON) "$(RAG_APP_DIR)/src/chroma_inspect.py" doc "$(DOC_ID)"

@@ -11,7 +11,7 @@ from common import CHROMA_DIR
 
 DEFAULT_COLLECTION = "documents"
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_LLM = "gemma4:e4b"
+DEFAULT_LLM = os.getenv("RAG_MODEL", "gemma3:1b")
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +53,8 @@ def format_sources(documents: list[str], metadatas: list[dict]) -> str:
 
 
 def build_prompt(question: str, context: str) -> str:
+    # Keep the generation step grounded: the model should answer from retrieved
+    # chunks and surface insufficiency instead of filling gaps from memory.
     return f"""You are a local programming research assistant.
 
 Answer the user's question using only the provided sources.
@@ -91,6 +93,7 @@ def main() -> None:
     query_embedding = model.encode([args.question], normalize_embeddings=True).tolist()[0]
     results = collection.query(query_embeddings=[query_embedding], n_results=args.top_k)
 
+    # Chroma returns one result list per query embedding; this CLI submits one question.
     documents = results["documents"][0]
     metadatas = results["metadatas"][0]
     if not documents:

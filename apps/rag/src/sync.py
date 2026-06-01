@@ -50,6 +50,8 @@ def sync_documents(source_dir: Path, limit: int | None) -> tuple[int, int]:
         existing = manifest["documents"].get(document.doc_id)
         unchanged = existing and existing.get("content_hash") == document.content_hash
 
+        # Preserve ingest bookkeeping across sync runs. A metadata-only sync
+        # should not make an already indexed, unchanged document look new.
         record = document_record_payload(document)
         if existing:
             for key in ("last_ingested_hash", "chunk_count", "indexed_at", "collection"):

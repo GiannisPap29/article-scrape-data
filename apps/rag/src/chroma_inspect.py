@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Any
 
 import chromadb
 
@@ -28,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_collection(name: str):
+def get_collection(name: str) -> Any:
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     try:
         return client.get_collection(name)

@@ -12,6 +12,9 @@ STATE_DIR = DATA_DIR / "state"
 CHROMA_DIR = DATA_DIR / "chroma"
 MANIFEST_PATH = STATE_DIR / "manifest.json"
 MANIFEST_SCHEMA_VERSION = 1
+
+# The scraper sidecar is the cross-app contract. Only accept versions whose
+# required fields are understood by the manifest importer and Chroma ingester.
 SUPPORTED_SCRAPER_METADATA_VERSIONS = {2, 3}
 DEFAULT_SCRAPER_OUTPUT_DIR = DATA_DIR / "output"
 
@@ -72,6 +75,8 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 def load_manifest() -> dict[str, Any]:
     ensure_directories()
     if not MANIFEST_PATH.exists():
+        # The manifest is deliberately local runtime state, not source data.
+        # data/output remains the source of truth and can recreate this file.
         return {
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "last_sync_at": None,
@@ -153,6 +158,7 @@ def document_record_payload(document: ImportedDocument) -> dict[str, Any]:
 
 
 def chunk_text(text: str, target_chars: int = 2200, overlap_chars: int = 250) -> list[str]:
+    """Split article text into retrieval-sized chunks while preserving paragraph boundaries."""
     paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
     chunks: list[str] = []
     current: list[str] = []
@@ -169,6 +175,8 @@ def chunk_text(text: str, target_chars: int = 2200, overlap_chars: int = 250) ->
             current = []
             current_len = 0
             return
+        # Seed the next chunk with trailing context so answers can bridge a
+        # paragraph boundary without relying on adjacent chunk retrieval.
         overlap_seed = chunk[-overlap_chars:].strip()
         current = [overlap_seed] if overlap_seed else []
         current_len = len(overlap_seed)
@@ -199,6 +207,7 @@ def chunk_text(text: str, target_chars: int = 2200, overlap_chars: int = 250) ->
 
 
 def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Convert optional/list metadata into scalar Chroma-compatible values."""
     cleaned: dict[str, Any] = {}
     for key, value in metadata.items():
         if value is None:

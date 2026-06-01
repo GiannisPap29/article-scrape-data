@@ -231,6 +231,10 @@ const SECURITY_VERIFICATION_PATTERNS = [
   "please wait while we verify",
   "just a moment"
 ];
+const FREEDIUM_ARTICLE_SELECTOR = "article";
+const FREEDIUM_CONTENT_FALLBACK_SELECTOR = ".main-content, main, .content";
+const FREEDIUM_CONTENT_TIMEOUT_MS = 90000;
+const FREEDIUM_MIN_CONTENT_CHARS = 500;
 
 const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
   "about",
@@ -245,6 +249,9 @@ const BLOCKED_MEDIUM_PATH_PREFIXES = new Set([
   "tag",
   "topics"
 ]);
+
+// Keep this version aligned with apps/rag/src/common.py so new sidecars remain
+// accepted by the RAG sync step.
 const SCRAPER_METADATA_VERSION = 3;
 const ARTICLE_UI_ARTIFACT_LINES = new Set([
   "copy",
@@ -577,6 +584,8 @@ async function ingestDriveQueue(options: DriveWorkerOptions): Promise<DriveInges
         const sourceUrl = extractSingleArticleUrlFromText(text);
         logInfo(`Drive ingest URL extracted: ${file.name} (${file.id}) -> ${sourceUrl}`);
 
+        // Drive ingest only stages work. Already-known files are archived, and
+        // new URLs go into the retryable queue for scrape-queue to promote.
         if (getScrapedUrlRecord(scrapedDb, sourceUrl)) {
           await moveDriveFileToFolder(session, file.id, archiveFolderId);
           summary.archived += 1;
@@ -1291,6 +1300,8 @@ function extractSingleArticleUrlFromText(text: string): string {
     throw new Error(`Drive file contains multiple Medium article URLs: ${articleUrls.join(", ")}`);
   }
 
+  // A Drive inbox file is intentionally one article. That keeps queue rows,
+  // archive moves, and failure handling easy to reason about.
   return articleUrls[0];
 }
 
@@ -1502,6 +1513,8 @@ async function createDriveBinaryFile(
 function openQueueDatabase(queueDbFile: string): DatabaseSync {
   mkdirSyncLike(path.dirname(queueDbFile));
   const db = new DatabaseSync(queueDbFile);
+  // Retryable staging table. Rows stay here until article text and sidecar
+  // metadata are written successfully and the URL is promoted to scraped_urls.
   db.exec(`
     CREATE TABLE IF NOT EXISTS url_from_drive (
       source_url TEXT PRIMARY KEY,
@@ -1579,6 +1592,8 @@ async function scrapeAndWriteUrl(
 function openTrackingDatabase(dbFile: string): DatabaseSync {
   mkdirSyncLike(path.dirname(dbFile));
   const db = new DatabaseSync(dbFile);
+  // Final success history. A row here means the matching .txt/.json outputs
+  // were saved successfully at least once.
   db.exec(`
     CREATE TABLE IF NOT EXISTS scraped_urls (
       source_url TEXT PRIMARY KEY,
@@ -1773,6 +1788,8 @@ function ensureScrapedUrlsColumns(db: DatabaseSync): void {
     ["tags_json", "TEXT"]
   ].filter(([name]) => !existingColumns.has(name));
 
+  // Lightweight in-place migration for older local DB files created before
+  // metadata sidecars and RAG fields existed.
   for (const [name, type] of missingColumns) {
     db.exec(`ALTER TABLE scraped_urls ADD COLUMN ${name} ${type};`);
   }
@@ -1880,15 +1897,14 @@ async function extractArticleContent(
     logInfo(`Freedium result URL: ${page.url()}`);
     await assertNoSecurityVerification(page, article.sourceUrl);
 
-    const mainContent = page.locator(".main-content, main, article, .content").first();
     logInfo(`Freedium waiting for content: ${article.sourceUrl}`);
-    await mainContent.waitFor({ state: "visible", timeout: 30000 });
+    await waitForFreediumArticleContent(page, article.sourceUrl);
     const extractedTitle = await extractArticleTitle(page, article);
     const metadataFields = await extractDocumentMetadata(page, extractedTitle);
     const footerContent = await page
       .locator(".flex.flex-wrap.gap-2.mt-5")
       .first()
-      .innerText()
+      .innerText({ timeout: 2000 })
       .then((value) => normalizeText(value))
       .catch(() => null);
 
@@ -1942,12 +1958,73 @@ async function assertNoSecurityVerification(page: Page, sourceUrl: string): Prom
   }
 }
 
+async function waitForFreediumArticleContent(page: Page, sourceUrl: string): Promise<void> {
+  await page.waitForFunction(
+    ({ articleSelector, fallbackSelector, minContentChars }) => {
+      const root = document.querySelector<HTMLElement>(articleSelector) ??
+        document.querySelector<HTMLElement>(fallbackSelector);
+      if (!root) {
+        return false;
+      }
+
+      const text = root.innerText.replace(/\s+/g, " ").trim();
+      const lowerText = text.toLowerCase();
+      if (
+        lowerText.includes("paste any paywalled article link below") ||
+        lowerText.includes("recently unlocked by the community")
+      ) {
+        return false;
+      }
+
+      return text.length >= minContentChars && Boolean(root.querySelector("h1, h2, p, pre, blockquote"));
+    },
+    {
+      articleSelector: FREEDIUM_ARTICLE_SELECTOR,
+      fallbackSelector: FREEDIUM_CONTENT_FALLBACK_SELECTOR,
+      minContentChars: FREEDIUM_MIN_CONTENT_CHARS,
+    },
+    { timeout: FREEDIUM_CONTENT_TIMEOUT_MS }
+  ).catch(async (error: unknown) => {
+    const bodyPreview = await page
+      .locator("body")
+      .innerText({ timeout: 1000 })
+      .then((value) => normalizeText(value).slice(0, 500))
+      .catch(() => "");
+    const previewSuffix = bodyPreview ? ` bodyPreview=${JSON.stringify(bodyPreview)}` : "";
+    throw new Error(`Timed out waiting for Freedium article content for ${sourceUrl}.${previewSuffix}`, {
+      cause: error
+    });
+  });
+}
+
 async function saveDebugPage(page: Page, outputDir: string, baseName: string): Promise<void> {
   const htmlPath = path.join(outputDir, `${baseName}.html`);
   const screenshotPath = path.join(outputDir, `${baseName}.png`);
-  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
-  await writeFile(htmlPath, await page.content(), "utf8").catch(() => undefined);
-  logWarn(`Saved debug page artifacts: ${htmlPath} and ${screenshotPath}`);
+  const savedArtifacts: string[] = [];
+
+  if (page.isClosed()) {
+    logWarn(`Skipped debug page artifacts because the page is already closed: ${baseName}`);
+    return;
+  }
+
+  await page.screenshot({ path: screenshotPath, fullPage: true })
+    .then(() => savedArtifacts.push(screenshotPath))
+    .catch((error: unknown) => logWarn(`Failed to save debug screenshot: ${formatErrorWithCause(error)}`));
+
+  const html = await page.content()
+    .catch((error: unknown) => {
+      logWarn(`Failed to read debug page HTML: ${formatErrorWithCause(error)}`);
+      return null;
+    });
+  if (html !== null) {
+    await writeFile(htmlPath, html, "utf8")
+      .then(() => savedArtifacts.push(htmlPath))
+      .catch((error: unknown) => logWarn(`Failed to save debug HTML: ${formatErrorWithCause(error)}`));
+  }
+
+  if (savedArtifacts.length > 0) {
+    logWarn(`Saved debug page artifacts: ${savedArtifacts.join(" and ")}`);
+  }
 }
 
 function validateExtractedContent(content: string, sourceUrl: string): void {
@@ -2173,11 +2250,18 @@ async function extractDocumentMetadata(
 }
 
 async function extractStructuredArticleContent(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const root = document.querySelector<HTMLElement>(".main-content, main, article, .content");
+  return page.evaluate(({ articleSelector, fallbackSelector }) => {
+    const root = document.querySelector<HTMLElement>(articleSelector) ??
+      document.querySelector<HTMLElement>(fallbackSelector);
     if (!root) {
       return "";
     }
+    const articleBody = root.tagName.toLowerCase() === "article"
+      ? Array.from(root.children)
+        .filter((child): child is HTMLElement => child instanceof HTMLElement)
+        .filter((child) => child.tagName.toLowerCase() === "div" && child.classList.contains("p-6"))
+        .sort((left, right) => right.innerText.length - left.innerText.length)[0] ?? root
+      : root;
 
     const normalizeInline = (value: string) => value.replace(/\s+/g, " ").trim();
     const getImageSource = (image: HTMLImageElement) =>
@@ -2215,6 +2299,8 @@ async function extractStructuredArticleContent(page: Page): Promise<string> {
     const walk = (element: Element) => {
       const tag = element.tagName.toLowerCase();
 
+      // Serialize into a small Markdown-like text format so code blocks,
+      // images, lists, and quotes survive the scraper-to-reader/RAG handoff.
       if (tag === "pre") {
         const code = element.textContent?.replace(/\r\n/g, "\n").replace(/\n+$/u, "").trimEnd();
         if (code) {
@@ -2301,11 +2387,14 @@ async function extractStructuredArticleContent(page: Page): Promise<string> {
       }
     };
 
-    for (const child of Array.from(root.children)) {
+    for (const child of Array.from(articleBody.children)) {
       walk(child);
     }
 
     return blocks.join("\n\n");
+  }, {
+    articleSelector: FREEDIUM_ARTICLE_SELECTOR,
+    fallbackSelector: FREEDIUM_CONTENT_FALLBACK_SELECTOR
   });
 }
 
@@ -2399,6 +2488,8 @@ async function writeExtraction(
   const scrapedAt = new Date().toISOString();
   const batchId = scrapedAt.slice(0, 10);
   const contentHash = createHash("sha256").update(body).digest("hex");
+  // The .txt body and .json sidecar share one stable basename derived from the
+  // normalized URL. Downstream apps treat this pair as the document contract.
   const metadata: PersistedDocumentMetadata = {
     author: result.author,
     authorBio: result.authorBio,
@@ -2423,6 +2514,8 @@ async function writeExtraction(
   await writeFile(outputPath, body, "utf8");
   await writeFile(metadataPath, JSON.stringify(metadata, null, 2), "utf8");
 
+  // If an older version wrote a different path for this URL, remove that stale
+  // pair after the new stable pair exists.
   const previousOutputPath = existingOutputPath ? path.resolve(existingOutputPath) : null;
   if (previousOutputPath && previousOutputPath !== outputPath && existsSync(previousOutputPath)) {
     await unlink(previousOutputPath).catch(() => undefined);

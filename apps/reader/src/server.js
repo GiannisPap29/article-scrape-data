@@ -13,10 +13,12 @@ const DEFAULT_HOST = process.env.READER_HOST ?? "127.0.0.1";
 function parsePort(argv) {
   const arg = argv.find((entry) => entry.startsWith("--port="));
   if (arg) {
-    return Number.parseInt(arg.slice("--port=".length), 10);
+    const parsed = Number.parseInt(arg.slice("--port=".length), 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_PORT;
   }
   if (process.env.PORT) {
-    return Number.parseInt(process.env.PORT, 10);
+    const parsed = Number.parseInt(process.env.PORT, 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_PORT;
   }
   return DEFAULT_PORT;
 }
@@ -61,6 +63,9 @@ function buildTextPath(sidecarPath, outputPath) {
     return fallbackPath;
   }
 
+  // Sidecars may contain host paths from the scraper or mounted container paths.
+  // Resolve by basename inside OUTPUT_DIR so the reader works both locally and
+  // in the Docker container.
   const outputBasename = path.basename(outputPath);
   const mountedOutputPath = path.join(OUTPUT_DIR, outputBasename);
 
@@ -88,6 +93,8 @@ export async function loadArticles() {
   const sidecars = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
   const articles = [];
 
+  // JSON sidecars are the catalogue. Missing or invalid sidecars are skipped so
+  // one bad scrape artifact does not prevent the reader from starting.
   for (const entry of sidecars) {
     const sidecarPath = path.join(OUTPUT_DIR, entry.name);
     let metadata;
@@ -208,6 +215,8 @@ function renderRichBody(content) {
     paragraph = [];
   };
 
+  // Render the scraper's small Markdown-like format without pulling in a full
+  // Markdown parser for this local-only reader.
   for (const rawLine of lines) {
     const trimmed = rawLine.trim();
 
