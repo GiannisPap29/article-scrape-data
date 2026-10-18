@@ -49,6 +49,7 @@ class ImportedDocument:
     site_name: str | None = None
     published_at: str | None = None
     language: str | None = None
+    freedium_url: str | None = None
 
 
 def utc_now_iso() -> str:
@@ -122,6 +123,7 @@ def build_imported_document(sidecar: dict[str, Any], sidecar_path: Path) -> Impo
         doc_id=sidecar["docId"],
         title=sidecar["title"],
         source_url=sidecar["sourceUrl"],
+        freedium_url=sidecar.get("freediumUrl") or (sidecar.get("freedium") or {}).get("url"),
         content_hash=sidecar["contentHash"],
         scraped_at=sidecar["scrapedAt"],
         batch_id=sidecar["batchId"],
@@ -142,6 +144,7 @@ def document_record_payload(document: ImportedDocument) -> dict[str, Any]:
         "doc_id": document.doc_id,
         "title": document.title,
         "source_url": document.source_url,
+        "freedium_url": document.freedium_url,
         "content_hash": document.content_hash,
         "scraped_at": document.scraped_at,
         "batch_id": document.batch_id,

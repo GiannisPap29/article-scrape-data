@@ -47,7 +47,14 @@ Start the local Ollama server:
 ollama serve
 ```
 
-In another terminal, pull the Gemma 4 E4B model used by this repo:
+In another terminal, pull the default Gemma model used by this repo:
+
+```bash
+ollama pull gemma3:1b
+```
+
+For better answers at the cost of speed and memory, pull Gemma 4 E4B and set
+`RAG_MODEL=gemma4:e4b` in `.env`:
 
 ```bash
 ollama pull gemma4:e4b
@@ -70,7 +77,7 @@ If you want the core Python packages explicitly, they are:
 You also need:
 
 - Ollama running locally
-- a local Gemma model available in Ollama, defaulting to `gemma4:e4b`
+- a local Gemma model available in Ollama, defaulting to `gemma3:1b` (override with `RAG_MODEL`)
 
 ### Reader
 
@@ -222,6 +229,7 @@ Optional enrichment:
 - `excerpt`
 - `publishedAt`
 - `language`
+- `freediumUrl` (the final Freedium URL used to fetch the article; older sidecars use `freedium.url`)
 
 ## Notes
 
@@ -230,7 +238,7 @@ Optional enrichment:
 - `data/state/` and `data/chroma/` are generated local artifacts and are ignored by Git.
 - The default embedding model is `sentence-transformers/all-MiniLM-L6-v2`.
 - The first `rag-ingest` may download model assets if they are not cached yet.
-- The default Ollama model is `gemma4:e4b`, configurable in `apps/rag/src/query.py`.
+- The default Ollama model is `gemma3:1b`, configurable with `RAG_MODEL` in `.env` or on the make command line.
 
 Official references:
 
@@ -253,6 +261,7 @@ The metadata sidecar includes:
 - `siteName`
 - `excerpt`
 - `sourceUrl`
+- `freediumUrl`
 - `outputPath`
 - `metadataPath`
 - `scrapedAt`
@@ -279,7 +288,7 @@ The sidecar schema is versioned. `scraperMetadataVersion=2` means:
 - `data/url_from_drive.db` is the durable staging queue.
 - `data/scraped-urls.db` is the final success history.
 - `make rescan` ignores the duplicate skip and re-scrapes every tracked `source_url` already stored in `data/scraped-urls.db`.
-- SQLite table: `scraped_urls(source_url, output_path, scraped_at, doc_id, title, author, site_name, excerpt, metadata_path, content_hash, published_at, language, tags_json)`.
+- SQLite table: `scraped_urls(source_url, freedium_url, output_path, scraped_at, doc_id, title, author, site_name, excerpt, metadata_path, content_hash, published_at, language, tags_json)`.
 - `make reset-db` clears only SQLite history, not existing output files.
 - `make clean-output` removes local `.txt`, `.json`, `.html`, and `.png` output artifacts.
 

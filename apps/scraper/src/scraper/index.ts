@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { type AddressInfo } from "node:net";
 import os from "node:os";
@@ -146,6 +146,7 @@ type ScrapedUrlRecord = {
   contentHash: string | null;
   docId: string | null;
   excerpt: string | null;
+  freediumUrl: string | null;
   language: string | null;
   metadataPath: string | null;
   outputPath: string;
@@ -180,7 +181,8 @@ type PersistedDocumentMetadata = {
   contentHash: string;
   docId: string;
   excerpt: string | null;
-  freedium?: FreediumMetadata;
+  freediumUrl: string | null;
+  freedium: FreediumMetadata;
   language: string | null;
   metadataPath: string;
   outputPath: string;
@@ -285,7 +287,7 @@ async function main(): Promise<void> {
 
   if (options.command === "rescan-db") {
     const summary = await rescrapeTrackedUrls(options);
-    logInfo(`DB rescan finished: total=${summary.total} saved=${summary.saved} rescraped=${summary.rescraped} skipped=${summary.skipped} failed=${summary.failed}`);
+    logInfo(`DB rescan finished: total=${summary.total} saved=${summary.saved} rescraped=${summary.rescraped} failed=${summary.failed}`);
     return;
   }
 
@@ -487,23 +489,6 @@ function requiredFlagValue(arg: string, flagName: string): string {
   return value;
 }
 
-function parsePositiveInteger(value: string | null, label: string, fallback?: number): number {
-  if (value === null || value === "") {
-    if (fallback !== undefined) {
-      return fallback;
-    }
-
-    throw new Error(`Missing value for ${label}.`);
-  }
-
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new Error(`Invalid ${label} value: ${value}`);
-  }
-
-  return parsed;
-}
-
 function readEnv(name: string): string | null {
   const value = process.env[name]?.trim();
   return value ? value : null;
@@ -702,6 +687,7 @@ async function scrapeQueuedUrls(
           contentHash: result.contentHash,
           docId: result.docId,
           excerpt: result.excerpt,
+          freediumUrl: result.freedium.url,
           language: result.language,
           metadataPath: result.metadataPath,
           outputPath: result.outputPath,
@@ -732,7 +718,7 @@ async function scrapeQueuedUrls(
 
 async function rescrapeTrackedUrls(
   options: Pick<CliOptions, "browser" | "connectUrl" | "dbFile" | "headless" | "outputDir">
-): Promise<{ failed: number; rescraped: number; saved: number; skipped: number; total: number; }> {
+): Promise<{ failed: number; rescraped: number; saved: number; total: number; }> {
   const dbFile = path.resolve(process.cwd(), options.dbFile);
   const db = openTrackingDatabase(dbFile);
 
@@ -744,7 +730,6 @@ async function rescrapeTrackedUrls(
         failed: 0,
         rescraped: 0,
         saved: 0,
-        skipped: 0,
         total: 0
       };
     }
@@ -752,7 +737,6 @@ async function rescrapeTrackedUrls(
     logInfo(`DB rescan queued ${records.length} tracked URL(s).`);
     let failed = 0;
     let rescraped = 0;
-    let skipped = 0;
 
     for (const [index, record] of records.entries()) {
       try {
@@ -763,6 +747,7 @@ async function rescrapeTrackedUrls(
           contentHash: result.contentHash,
           docId: result.docId,
           excerpt: result.excerpt,
+          freediumUrl: result.freedium.url,
           language: result.language,
           metadataPath: result.metadataPath,
           outputPath: result.outputPath,
@@ -785,7 +770,6 @@ async function rescrapeTrackedUrls(
       failed,
       rescraped,
       saved: rescraped,
-      skipped,
       total: records.length
     };
   } finally {
@@ -806,7 +790,7 @@ function showDatabases(options: Pick<CliOptions, "dbFile" | "queueDbFile">): voi
     console.log(`scraped_urls (${scrapedRows.length})`);
     for (const row of scrapedRows) {
       console.log(
-        `${row.scrapedAt}\t${row.sourceUrl}\t${row.outputPath}\t${row.metadataPath ?? ""}\t${row.docId ?? ""}\t${row.contentHash ?? ""}`
+        `${row.scrapedAt}\t${row.sourceUrl}\t${row.freediumUrl ?? ""}\t${row.outputPath}\t${row.metadataPath ?? ""}\t${row.docId ?? ""}\t${row.contentHash ?? ""}`
       );
     }
 
@@ -1181,7 +1165,10 @@ async function writeGoogleOAuthToken(tokenFile: string, token: GoogleOAuthToken)
     refresh_token: token.refreshToken,
     scope: token.scope,
     token_type: token.tokenType
-  }, null, 2), "utf8");
+  }, null, 2), { encoding: "utf8", mode: 0o600 });
+  // writeFile's mode only applies on creation; tighten token files written by
+  // older versions too, since they hold a long-lived Drive refresh token.
+  await chmod(tokenFile, 0o600);
 }
 
 async function listSupportedDriveFilesInFolder(session: GoogleOAuthToken, folderId: string): Promise<DriveDocumentFile[]> {
@@ -1622,6 +1609,7 @@ function getScrapedUrlRecord(db: DatabaseSync, sourceUrl: string): ScrapedUrlRec
         author AS author,
         site_name AS siteName,
         excerpt AS excerpt,
+        freedium_url AS freediumUrl,
         metadata_path AS metadataPath,
         content_hash AS contentHash,
         published_at AS publishedAt,
@@ -1647,6 +1635,7 @@ function getAllScrapedUrlRecords(db: DatabaseSync): ScrapedUrlRecord[] {
         author AS author,
         site_name AS siteName,
         excerpt AS excerpt,
+        freedium_url AS freediumUrl,
         metadata_path AS metadataPath,
         content_hash AS contentHash,
         published_at AS publishedAt,
@@ -1726,13 +1715,14 @@ function upsertScrapedUrlRecord(db: DatabaseSync, record: ScrapedUrlRecord): voi
         author,
         site_name,
         excerpt,
+        freedium_url,
         metadata_path,
         content_hash,
         published_at,
         language,
         tags_json
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(source_url) DO UPDATE SET
         output_path = excluded.output_path,
         scraped_at = excluded.scraped_at,
@@ -1741,6 +1731,7 @@ function upsertScrapedUrlRecord(db: DatabaseSync, record: ScrapedUrlRecord): voi
         author = excluded.author,
         site_name = excluded.site_name,
         excerpt = excluded.excerpt,
+        freedium_url = excluded.freedium_url,
         metadata_path = excluded.metadata_path,
         content_hash = excluded.content_hash,
         published_at = excluded.published_at,
@@ -1756,6 +1747,7 @@ function upsertScrapedUrlRecord(db: DatabaseSync, record: ScrapedUrlRecord): voi
       record.author,
       record.siteName,
       record.excerpt,
+      record.freediumUrl,
       record.metadataPath,
       record.contentHash,
       record.publishedAt,
@@ -1781,6 +1773,7 @@ function ensureScrapedUrlsColumns(db: DatabaseSync): void {
     ["author", "TEXT"],
     ["site_name", "TEXT"],
     ["excerpt", "TEXT"],
+    ["freedium_url", "TEXT"],
     ["metadata_path", "TEXT"],
     ["content_hash", "TEXT"],
     ["published_at", "TEXT"],
@@ -1793,6 +1786,13 @@ function ensureScrapedUrlsColumns(db: DatabaseSync): void {
   for (const [name, type] of missingColumns) {
     db.exec(`ALTER TABLE scraped_urls ADD COLUMN ${name} ${type};`);
   }
+
+  // Older rows used the original article URL as source_url but did not retain
+  // the Freedium URL used to fetch them. Reconstruct the deterministic URL so
+  // the database remains useful even before a full rescan.
+  db.prepare(
+    "UPDATE scraped_urls SET freedium_url = ? || source_url WHERE freedium_url IS NULL OR freedium_url = ''"
+  ).run(TARGET_URL);
 }
 
 function createSQLiteBackup(sourceDbFile: string, backupDbFile: string): void {
@@ -2498,6 +2498,7 @@ async function writeExtraction(
     contentHash,
     docId: result.article.docId,
     excerpt: result.excerpt,
+    freediumUrl: result.freedium.url,
     freedium: result.freedium,
     language: result.language,
     metadataPath,

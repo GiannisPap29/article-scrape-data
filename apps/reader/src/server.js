@@ -115,20 +115,31 @@ export async function loadArticles() {
     const tags = Array.isArray(metadata.tags) ? metadata.tags.map((tag) => String(tag)) : [];
     const author = metadata.author ? String(metadata.author) : "";
     const language = metadata.language ? String(metadata.language) : "";
+    const freediumUrl = metadata.freediumUrl || metadata.freedium?.url || "";
     const domain = toDomain(metadata.sourceUrl);
     const wordCount = body.trim() ? body.trim().split(/\s+/).length : 0;
 
     articles.push({
       author,
+      authorBio: metadata.authorBio ? String(metadata.authorBio) : "",
+      authorUrl: metadata.authorUrl ? String(metadata.authorUrl) : "",
+      batchId: metadata.batchId ? String(metadata.batchId) : "",
       body,
+      contentHash: metadata.contentHash ? String(metadata.contentHash) : "",
       docId: String(metadata.docId ?? path.basename(entry.name, ".json")),
       domain,
       excerpt: metadata.excerpt ? String(metadata.excerpt) : "",
+      freedium: metadata.freedium ?? {},
+      freediumUrl: String(freediumUrl),
       language,
+      metadataPath: String(metadata.metadataPath ?? sidecarPath),
       path: textPath,
       publishedAt: metadata.publishedAt ? String(metadata.publishedAt) : "",
       scrapedAt: metadata.scrapedAt ? String(metadata.scrapedAt) : "",
       sourceUrl: metadata.sourceUrl ? String(metadata.sourceUrl) : "",
+      outputPath: String(metadata.outputPath ?? textPath),
+      siteName: metadata.siteName ? String(metadata.siteName) : "",
+      scraperMetadataVersion: metadata.scraperMetadataVersion ?? null,
       tags,
       title: metadata.title ? String(metadata.title) : path.basename(entry.name, ".json"),
       wordCount
@@ -142,6 +153,7 @@ export async function loadArticles() {
 }
 
 export function filterArticles(articles, query) {
+  const searchQuery = (query.q ?? "").trim().toLowerCase();
   const titleQuery = (query.title ?? "").trim().toLowerCase();
   const tag = (query.tag ?? "").trim();
   const author = (query.author ?? "").trim();
@@ -150,6 +162,21 @@ export function filterArticles(articles, query) {
   const sort = (query.sort ?? "published").trim();
 
   let filtered = articles.filter((article) => {
+    if (searchQuery) {
+      const searchable = [
+        article.title,
+        article.author,
+        article.siteName,
+        article.excerpt,
+        article.sourceUrl,
+        article.freediumUrl,
+        article.tags.join(" "),
+        article.body
+      ].join(" ").toLowerCase();
+      if (!searchable.includes(searchQuery)) {
+        return false;
+      }
+    }
     if (titleQuery && !article.title.toLowerCase().includes(titleQuery)) {
       return false;
     }
@@ -327,6 +354,25 @@ function pageShell(title, body) {
       max-width: 44rem;
       font-size: 1rem;
     }
+    .eyebrow {
+      margin: 0 0 0.65rem !important;
+      color: var(--accent) !important;
+      font: 700 0.78rem/1 system-ui, sans-serif !important;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+    .hero-stat {
+      min-width: 9rem;
+      padding: 1rem 1.1rem;
+      border: 1px solid rgba(29, 107, 87, 0.18);
+      border-radius: 18px;
+      background: var(--accent-soft);
+      color: #16463b;
+      font-family: system-ui, sans-serif;
+    }
+    .hero-stat strong, .hero-stat span { display: block; }
+    .hero-stat strong { font: 700 2rem/1 system-ui, sans-serif; }
+    .hero-stat span { margin-top: 0.35rem; font-size: 0.82rem; }
     .grid {
       display: grid;
       grid-template-columns: 320px 1fr;
@@ -369,6 +415,28 @@ function pageShell(title, body) {
       color: var(--text);
       font: inherit;
       margin-bottom: 0.8rem;
+    }
+    input:focus, select:focus {
+      outline: 3px solid rgba(29, 107, 87, 0.18);
+      border-color: var(--accent);
+    }
+    .filter-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 0.75rem;
+    }
+    .filter-count, .hint {
+      color: var(--muted);
+      font: 0.78rem system-ui, sans-serif;
+    }
+    .hint { margin: -0.35rem 0 1rem; line-height: 1.4; }
+    details { margin: 0.6rem 0; }
+    summary {
+      margin-bottom: 0.8rem;
+      cursor: pointer;
+      color: var(--accent);
+      font: 700 0.8rem system-ui, sans-serif;
     }
     .filter-actions {
       display: flex;
@@ -420,6 +488,16 @@ function pageShell(title, body) {
       margin: 0 0 0.4rem;
       line-height: 1.05;
     }
+    .card h3 {
+      font-size: clamp(1.35rem, 2vw, 1.75rem);
+      letter-spacing: -0.02em;
+    }
+    .article h1 {
+      font-size: clamp(2rem, 5vw, 3.5rem);
+      letter-spacing: -0.035em;
+    }
+    .card h3 a { color: var(--text); }
+    .card h3 a:hover { color: var(--accent); }
     .meta, .chips {
       display: flex;
       flex-wrap: wrap;
@@ -442,6 +520,23 @@ function pageShell(title, body) {
       color: #423a31;
       line-height: 1.55;
     }
+    .card-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.8rem;
+      margin-top: 0.9rem;
+    }
+    .small-button {
+      min-height: 2.2rem;
+      padding: 0 0.8rem;
+      font-size: 0.82rem;
+    }
+    .text-link {
+      color: var(--accent);
+      font: 700 0.82rem system-ui, sans-serif;
+    }
+    .muted-link { color: var(--muted); }
     .article {
       width: min(860px, calc(100vw - 2rem));
       margin: 0 auto;
@@ -507,6 +602,16 @@ function pageShell(title, body) {
       text-align: center;
       color: var(--muted);
     }
+    .data-note { font-size: 0.82rem; }
+    .live-dot {
+      display: inline-block;
+      width: 0.55rem;
+      height: 0.55rem;
+      margin-right: 0.3rem;
+      border-radius: 50%;
+      background: #2f9d72;
+      box-shadow: 0 0 0 4px rgba(47, 157, 114, 0.12);
+    }
     @media (max-width: 920px) {
       .grid {
         grid-template-columns: 1fr;
@@ -518,6 +623,7 @@ function pageShell(title, body) {
         flex-direction: column;
         align-items: start;
       }
+      .hero-stat { width: 100%; }
     }
   </style>
 </head>
@@ -549,15 +655,19 @@ export function renderIndex(articles, query) {
             .slice(0, 6)
             .map((tag) => `<span class="chip">${escapeHtml(tag)}</span>`)
             .join("");
+          const sourceLinks = [
+            article.freediumUrl ? `<a class="button small-button" href="${escapeHtml(article.freediumUrl)}" target="_blank" rel="noopener noreferrer">Open in Freedium ↗</a>` : "",
+            article.sourceUrl ? `<a class="text-link muted-link" href="${escapeHtml(article.sourceUrl)}" target="_blank" rel="noreferrer">Original ↗</a>` : ""
+          ].filter(Boolean).join("");
 
           return `<article class="card">
   <h3><a href="/article/${encodeURIComponent(article.docId)}">${escapeHtml(article.title)}</a></h3>
   <div class="meta">
-    <span>Published ${escapeHtml(formatDate(article.publishedAt || article.scrapedAt))}</span>
+    <span>${article.author ? `By ${escapeHtml(article.author)} · ` : ""}${escapeHtml(formatDate(article.publishedAt || article.scrapedAt))}</span>
   </div>
   <div class="chips">${chips}${tagChips}</div>
   ${article.excerpt ? `<p class="excerpt">${escapeHtml(article.excerpt)}</p>` : ""}
-  <a class="button secondary" href="/article/${encodeURIComponent(article.docId)}">Read article</a>
+  <div class="card-actions"><a class="button" href="/article/${encodeURIComponent(article.docId)}">Read article</a>${sourceLinks}</div>
 </article>`;
         })
         .join("")
@@ -568,13 +678,20 @@ export function renderIndex(articles, query) {
     `<main class="layout">
   <section class="hero">
     <div>
-      <h1>Article Reader</h1>
-      <p>Browse the local article corpus from <code>data/output/</code>. Search by metadata, filter by tags and source, and open full text for reading.</p>
+      <p class="eyebrow">Your local reading library</p>
+      <h1>Find something worth keeping.</h1>
+      <p>Search across ${articles.length} saved articles, then read the clean local copy with the original and Freedium links beside it.</p>
     </div>
+    <div class="hero-stat"><strong>${articles.length}</strong><span>articles saved</span></div>
   </section>
   <section class="grid">
     <form class="filters panel" method="get" action="/">
-      <h2>Filters</h2>
+      <div class="filter-heading"><h2>Find an article</h2><span class="filter-count">${filtered.length} results</span></div>
+      <label for="q">Search everything</label>
+      <input id="q" name="q" value="${escapeHtml(query.q ?? "")}" placeholder="Try: Go concurrency, Kubernetes, AI" autofocus>
+      <p class="hint">Searches titles, text, authors, tags, and URLs.</p>
+      <details ${query.title || query.tag || query.author || query.language || query.domain ? "open" : ""}>
+        <summary>More filters</summary>
       <label for="title">Title search</label>
       <input id="title" name="title" value="${escapeHtml(query.title ?? "")}" placeholder="Search article title">
       <label for="tag">Tag</label>
@@ -587,15 +704,16 @@ export function renderIndex(articles, query) {
       <select id="domain" name="domain">${renderOptions(domains, query.domain ?? "", "All domains")}</select>
       <label for="sort">Sort</label>
       <select id="sort" name="sort">${renderOptions(["published", "oldest", "title"], query.sort ?? "published", "Published")}</select>
+      </details>
       <div class="filter-actions">
-        <button class="button" type="submit">Apply</button>
+        <button class="button" type="submit">Search library</button>
         <a class="button secondary" href="/">Reset</a>
       </div>
     </form>
     <section class="content panel">
       <div class="summary">
-        <div>${filtered.length} articles shown of ${articles.length}</div>
-        <div>Live from ${escapeHtml(OUTPUT_DIR)}</div>
+        <div><strong>${filtered.length}</strong> ${filtered.length === 1 ? "article" : "articles"} shown${query.q || query.title || query.tag || query.author || query.language || query.domain ? " · filters active" : ""}</div>
+        <div class="data-note"><span class="live-dot"></span> Reading from <code>data/output/</code></div>
       </div>
       <div class="cards">${cards}</div>
     </section>
@@ -614,13 +732,27 @@ export function renderArticle(article) {
     .filter(Boolean)
     .join("");
   const tags = article.tags.map((tag) => `<span class="chip">${escapeHtml(tag)}</span>`).join("");
+  const author = article.author
+    ? article.authorUrl
+      ? `<a class="text-link" href="${escapeHtml(article.authorUrl)}" target="_blank" rel="noreferrer">${escapeHtml(article.author)}</a>`
+      : escapeHtml(article.author)
+    : "";
+  const sourceDetails = [
+    author ? `By ${author}` : "",
+    article.siteName ? escapeHtml(article.siteName) : "",
+    article.wordCount ? `${article.wordCount.toLocaleString()} words` : "",
+    article.scraperMetadataVersion ? `metadata v${escapeHtml(article.scraperMetadataVersion)}` : ""
+  ].filter(Boolean).join(' <span aria-hidden="true">·</span> ');
 
   return pageShell(
     article.title,
     `<main class="article">
   <div class="article-top">
     <a class="button secondary" href="/">Back to library</a>
-    ${article.sourceUrl ? `<a class="button" href="${escapeHtml(article.sourceUrl)}" target="_blank" rel="noreferrer">Open source</a>` : ""}
+    <div class="filter-actions">
+      ${article.sourceUrl ? `<a class="button secondary" href="${escapeHtml(article.sourceUrl)}" target="_blank" rel="noreferrer">Original article</a>` : ""}
+      ${article.freediumUrl ? `<a class="button" href="${escapeHtml(article.freediumUrl)}" target="_blank" rel="noreferrer">Open Freedium</a>` : ""}
+    </div>
   </div>
   <section class="panel" style="padding: 1.25rem; margin-bottom: 1rem;">
     <h1>${escapeHtml(article.title)}</h1>
@@ -628,6 +760,7 @@ export function renderArticle(article) {
       <span>Published ${escapeHtml(formatDate(article.publishedAt || article.scrapedAt))}</span>
       <span>Stored at ${escapeHtml(path.basename(article.path))}</span>
     </div>
+    ${sourceDetails ? `<div class="meta">${sourceDetails}</div>` : ""}
     <div class="chips">${chips}${tags}</div>
     ${article.excerpt ? `<p class="excerpt">${escapeHtml(article.excerpt)}</p>` : ""}
   </section>
@@ -643,6 +776,15 @@ export async function handler(request, response) {
   if (url.pathname === "/") {
     response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     response.end(renderIndex(articles, Object.fromEntries(url.searchParams.entries())));
+    return;
+  }
+
+  if (url.pathname === "/api/articles") {
+    response.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store"
+    });
+    response.end(JSON.stringify(articles));
     return;
   }
 
