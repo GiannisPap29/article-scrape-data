@@ -1,49 +1,53 @@
 from __future__ import annotations
 
 import argparse
-import os
 
-import chromadb
-from ollama import Client
-from sentence_transformers import SentenceTransformer
+import vectorstore
+from common import (
+    ANSWER_NUM_CTX,
+    VECTORS_DB_PATH,
+    OLLAMA_KEEP_ALIVE,
+    DEFAULT_EMBED_MODEL,
+    DEFAULT_LLM,
+    DEFAULT_OLLAMA_HOST,
+    collection_name_for,
+    embed_texts,
+    ensure_ollama_model,
+    format_for_embedding,
+    ollama_client,
+    unload_ollama_model,
+)
 
-from common import CHROMA_DIR
-
-DEFAULT_COLLECTION = "documents"
-DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_LLM = os.getenv("RAG_MODEL", "gemma3:1b")
+MAX_CHUNKS_PER_DOC = 2
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Query Chroma and ask Gemma for a grounded answer.")
+    parser = argparse.ArgumentParser(description="Search the local vector index and ask a local Ollama model for a grounded answer.")
     parser.add_argument("question", help="Question to answer against the local corpus.")
-    parser.add_argument("--collection", default=DEFAULT_COLLECTION, help="Chroma collection name.")
-    parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="SentenceTransformer model name.")
-    parser.add_argument("--model", default=DEFAULT_LLM, help="Ollama model name.")
-    parser.add_argument("--top-k", type=int, default=4, help="Number of retrieved chunks.")
+    parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Ollama embedding model name.")
     parser.add_argument(
-        "--ollama-host",
-        default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
-        help="Ollama host URL.",
+        "--collection",
+        default=None,
+        help="Vector collection name (default: derived from the embedding model).",
     )
-    parser.add_argument("--sources-only", action="store_true", help="Print retrieved sources without calling Gemma.")
+    parser.add_argument("--model", default=DEFAULT_LLM, help="Ollama model name for the answer.")
+    parser.add_argument("--top-k", type=int, default=5, help="Number of retrieved chunks.")
+    parser.add_argument("--ollama-host", default=DEFAULT_OLLAMA_HOST, help="Ollama host URL.")
+    parser.add_argument("--sources-only", action="store_true", help="Print retrieved sources without calling the LLM.")
     return parser.parse_args()
 
 
 def format_sources(documents: list[str], metadatas: list[dict]) -> str:
     sections = []
     for index, (document, metadata) in enumerate(zip(documents, metadatas, strict=False), start=1):
-        title = metadata.get("title", "Untitled")
-        source_url = metadata.get("source_url", "unknown")
-        filename = metadata.get("filename", "unknown")
-        chunk_index = metadata.get("chunk_index", "?")
         sections.append(
             "\n".join(
                 [
-                    f"[S{index}] {title}",
-                    f"url: {source_url}",
-                    f"file: {filename}",
-                    f"chunk_index: {chunk_index}",
+                    f"[S{index}] {metadata.get('title', 'Untitled')}",
+                    f"author: {metadata.get('author', 'unknown')}",
+                    f"url: {metadata.get('source_url', 'unknown')}",
+                    f"file: {metadata.get('filename', 'unknown')}",
+                    f"chunk_index: {metadata.get('chunk_index', '?')}",
                     "snippet:",
                     document.strip(),
                 ]
@@ -70,32 +74,40 @@ Sources:
 """
 
 
+def diversify(documents: list[str], metadatas: list[dict], top_k: int) -> tuple[list[str], list[dict]]:
+    """Keep the best-ranked chunks but at most MAX_CHUNKS_PER_DOC per article,
+    so one long article cannot crowd out every other source."""
+    kept_documents: list[str] = []
+    kept_metadatas: list[dict] = []
+    per_doc: dict[str, int] = {}
+    for document, metadata in zip(documents, metadatas, strict=False):
+        doc_id = str(metadata.get("doc_id"))
+        if per_doc.get(doc_id, 0) >= MAX_CHUNKS_PER_DOC:
+            continue
+        per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+        kept_documents.append(document)
+        kept_metadatas.append(metadata)
+        if len(kept_documents) >= top_k:
+            break
+    return kept_documents, kept_metadatas
+
+
 def main() -> None:
     args = parse_args()
+    collection_name = args.collection or collection_name_for(args.embed_model)
+    client = ollama_client(args.ollama_host)
+    ensure_ollama_model(client, args.embed_model, "embedding")
+
+    store = vectorstore.open_store(VECTORS_DB_PATH)
+    query_embedding = embed_texts(client, args.embed_model, [format_for_embedding(args.embed_model, "query", args.question)])[0]
     try:
-        model = SentenceTransformer(args.embed_model)
-    except Exception as exc:  # pragma: no cover - runtime environment dependent
-        raise SystemExit(
-            "Failed to load the embedding model used for retrieval. "
-            "Pass a local model path with --embed-model or run once with network access "
-            f"to cache it first. Requested model: {args.embed_model}\nOriginal error: {exc}"
-        ) from exc
+        hits = vectorstore.query(store, collection_name, query_embedding, args.top_k * 3)
+    except LookupError as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        store.close()
 
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    try:
-        collection = client.get_collection(args.collection)
-    except Exception as exc:  # pragma: no cover - runtime environment dependent
-        raise SystemExit(
-            f"Chroma collection '{args.collection}' does not exist yet. "
-            "Run apps/rag/src/ingest.py first."
-        ) from exc
-
-    query_embedding = model.encode([args.question], normalize_embeddings=True).tolist()[0]
-    results = collection.query(query_embeddings=[query_embedding], n_results=args.top_k)
-
-    # Chroma returns one result list per query embedding; this CLI submits one question.
-    documents = results["documents"][0]
-    metadatas = results["metadatas"][0]
+    documents, metadatas = diversify([hit[0] for hit in hits], [hit[1] for hit in hits], args.top_k)
     if not documents:
         raise SystemExit("The collection is empty or no matching documents were found.")
 
@@ -105,9 +117,16 @@ def main() -> None:
         print(context)
         return
 
-    prompt = build_prompt(args.question, context)
-    ollama = Client(host=args.ollama_host)
-    response = ollama.generate(model=args.model, prompt=prompt)
+    ensure_ollama_model(client, args.model, "answer")
+    # Only the question needed embedding; free that model before loading the
+    # answer model so both are never resident together.
+    unload_ollama_model(client, args.embed_model)
+    response = client.generate(
+        model=args.model,
+        prompt=build_prompt(args.question, context),
+        options={"num_ctx": ANSWER_NUM_CTX},
+        keep_alive=OLLAMA_KEEP_ALIVE,
+    )
 
     print(response["response"].strip())
     print("\nSources:")

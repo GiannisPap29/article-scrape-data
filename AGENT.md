@@ -1,146 +1,96 @@
 # AGENT
 
-## Project Purpose
+Instructions for AI coding agents working in this repo. User-facing docs are in
+`README.md`.
 
-This project ingests Medium article URLs from a Google Drive inbox, stages them in a queue database, scrapes article content through Freedium, and stores the extracted text plus metadata sidecars in `data/output`.
+## Purpose
 
-The repo is split into:
+Medium links saved in a Google Drive inbox (`MEDIUM`) are staged in a queue,
+scraped through Freedium, and stored as `.txt` (Markdown body) + `.json`
+(metadata) pairs in `data/output/`. A reader app serves them; a RAG app tags
+and indexes them for local questions and an MCP server.
 
-- `apps/scraper`: TypeScript scraper app
-- `apps/reader`: local Node reader app
-- `apps/rag`: Python RAG app
-- `data`: shared runtime contract between them
+## Apps and the shared contract
 
-The project is intentionally manual-only.
+- `apps/scraper` (TypeScript): Drive ingest, Freedium scraping, `data/library.db`, backups
+- `apps/reader` (Node, no deps): read-only website over `data/output` (+ auto tags from `data/state`)
+- `apps/rag` (Python): manifest, auto tags, sqlite-vec index, `rag-ask`, MCP server
 
-There is no always-running daemon or watcher loop.
+`data/` is the only contract between them. The scraper owns `data/output`,
+`data/library.db`, `data/backups`, `data/debug`; the RAG app owns `data/state`.
 
-## Current Workflow
+## Flow
 
-The system has two explicit stages:
+`make run` = scraper `--run` (ingest -> scrape queue -> URL list export ->
+Drive backup), then `rag-sync` -> `rag-tag` -> `rag-ingest`. It is guarded by
+`data/.run.lock`. Inside the recipe the scraper exit code decides: `0` ok, `2`
+some URLs failed (RAG still runs), other = crash (RAG skipped). make itself
+exits 0/2.
 
-1. `make ingest`
-2. `make scrape-queue`
+Ingest, per Drive file in MEDIUM (oldest first): extract exactly one article
+URL; already in history or queue -> move file to `MEDIUM_ARCHIVED`; new ->
+insert into the queue, then archive; no valid URL -> `MEDIUM_FAILED`.
+Archive/failed/backup folders are resolved inside the inbox first, then next to
+it (older layout), else created inside the inbox. Backups never go into the
+inbox itself.
 
-### Stage 1: Ingest
+Scrape queue, per due row (oldest first): open `<mirror>/<url>` (form and
+fallback mirrors as fallbacks), write `.txt` then `.json`, then
+`promoteQueuedUrl` (history upsert + queue delete in one transaction). On
+failure: `last_error`, `attempts`, `next_retry_at` (15 min doubling, max 12 h);
+after `MAX_SCRAPE_ATTEMPTS` or a Freedium 404 the row stays as "gave up" until
+`make retry-failed`. A debug HTML + screenshot goes to `data/debug/`.
 
-`make ingest` does this:
+## Database (`data/library.db`)
 
-1. Connects to the configured Google Drive inbox folder.
-2. Reads supported files:
-   - native Google Docs
-   - plain text-like Drive files
-3. Extracts exactly one Medium article URL from each file.
-4. Checks `data/scraped-urls.db`.
-5. Checks `data/url_from_drive.db`.
-6. If the URL is already scraped, the Drive file is moved to the archive folder.
-7. If the URL is already queued, the Drive file is moved to the archive folder.
-8. If the URL is new, it is inserted into `data/url_from_drive.db`, then the Drive file is moved to the archive folder.
-9. If parsing fails, the Drive file is moved to the failure folder.
+- `url_from_drive(source_url, drive_file_id, drive_file_name, queued_at, last_error, attempts, next_retry_at)`: retryable queue
+- `scraped_urls(source_url, output_path, scraped_at, doc_id, title, author, site_name, excerpt, freedium_url, metadata_path, content_hash, published_at, language, tags_json)`: success history
 
-### Stage 2: Scrape Queue
+RAG state (`data/state/`): `manifest.json` (per-document sync/index/tag
+bookkeeping) and `vectors.db` (`chunks` table + `vec_<collection>` tables).
 
-`make scrape-queue` does this:
+## Design rules
 
-1. Reads queued URLs from `data/url_from_drive.db` oldest-first.
-2. For each URL, scrapes content through Freedium.
-3. Saves the article text into `data/output`.
-4. Saves a metadata sidecar JSON with the same basename into `data/output`.
-5. Only after the `.txt` and `.json` files are written successfully:
-   - upserts the URL into `data/scraped-urls.db`
-   - removes the row from `data/url_from_drive.db`
-6. If scraping fails:
-   - the row remains in `data/url_from_drive.db`
-   - `last_error` is updated
+1. Manual-first: `make run` is the entry point. The nightly timer in
+   `deploy/systemd/` is only installed by `make schedule-install`; never install
+   or enable it automatically.
+2. Never scrape directly from Drive ingest; always go through the queue.
+3. Never promote a queue row before both output files are written.
+4. `scraped_urls` is success history only; `url_from_drive` is the retry queue.
+5. One normalized URL maps to one stable `<slug>-<hash>.txt`/`.json` pair; never
+   create variants like `slug-2.txt`.
+6. Drive parse failures go to the failure folder; scrape failures stay queued
+   with `last_error`.
+7. Article metadata is written by the scraper only. The RAG app never edits
+   `data/output` (auto tags live in the manifest).
+8. `data/output/` holds only `.txt`/`.json` pairs; write them atomically,
+   `.txt` before `.json`.
+9. Sidecar `outputPath`/`metadataPath` are file names relative to the sidecar
+   (v4); `library.db` keeps absolute paths. Readers must accept v2/v3 sidecars
+   (absolute paths) until every article is rescanned.
+10. Prefer Freedium's embedded article data (`freedium-data.ts`, parsed as a
+    literal, never evaluated) over DOM scraping. Bump `SCRAPER_METADATA_VERSION`
+    and the RAG supported set together.
+11. Never lose the URL list: `make run` refreshes `data/backups/scraped-urls.txt`;
+    destructive commands snapshot first.
+12. Memory is tight on the user's machine: keep Ollama `num_ctx` capped, unload
+    a model before loading the next (`unload_ollama_model`), never run tagging
+    and indexing in parallel.
+13. Keep `make test` green; tests use temp folders only.
 
-## Databases
+## Files
 
-### `data/url_from_drive.db`
-
-This is the staging queue.
-
-It stores URLs that were accepted from Google Drive but not yet successfully promoted to final history.
-
-Table:
-
-- `url_from_drive(source_url, drive_file_id, drive_file_name, queued_at, last_error)`
-
-### `data/scraped-urls.db`
-
-This is the final success history.
-
-A URL should appear here only after its text file and metadata sidecar have been saved successfully.
-
-Table:
-
-- `scraped_urls(source_url, output_path, scraped_at, doc_id, title, author, site_name, excerpt, metadata_path, content_hash, published_at, language, tags_json)`
-
-## Output File Rule
-
-One normalized URL must map to one stable `.txt` filename and one stable `.json` sidecar path.
-
-Important invariant:
-
-- the same normalized URL must always reuse the same output path
-- the sidecar metadata path must share the same basename as the text file
-- no duplicate variant files like `slug-2.txt` or `slug-3.txt` should be created for the same URL
-
-## Commands
-
-Primary commands:
-
-- `make ingest`
-- `make scrape-queue`
-- `make reader`
-- `make reader-up`
-- `make reader-down`
-- `make backup-db`
-- `make rescan`
-- `make show-db`
-- `make reset-db`
-- `make clean-output`
-
-## Environment
-
-Runtime settings are loaded from the root `.env` file.
-
-Important values:
-
-- `DRIVE_FOLDER_ID`
-- `DRIVE_ARCHIVE_FOLDER_ID`
-- `DRIVE_FAILED_FOLDER_ID`
-- `DRIVE_BACKUP_FOLDER_ID`
-- `DRIVE_BACKUP_FILE_NAME`
-- `URL_QUEUE_DB_FILE`
-- `DB_FILE`
-- `OUTPUT_DIR`
-- `GOOGLE_OAUTH_CLIENT_FILE`
-- `GOOGLE_OAUTH_TOKEN_FILE`
-- `HEADLESS`
-- `CONNECT_URL`
-
-## Design Constraints
-
-When changing this project, preserve these rules:
-
-1. Keep the flow manual-only unless explicitly requested otherwise.
-2. Do not bypass the queue DB by scraping directly from Drive ingest.
-3. Do not move a queue row into `scraped-urls.db` before the output file is written successfully.
-4. Keep `scraped-urls.db` as final success history only.
-5. Keep `url_from_drive.db` as the retryable staging queue.
-6. Preserve the one-URL-to-one-stable-output rule for `.txt` and `.json`.
-7. Keep Drive parse failures separate from scrape failures:
-   - parse failure => Drive failure folder
-   - scrape failure => keep row in queue DB with `last_error`
-8. Keep metadata export producer-side only unless the task is explicitly about the RAG app.
-
-## Files To Know
-
-- `apps/scraper/src/scraper/index.ts`: main CLI, Drive ingest, queue scrape, OAuth, DB helpers, Freedium scraping
-- `apps/scraper/src/config/index.ts`: shared defaults
-- `apps/reader/src/server.js`: local reader UI over `data/output`
-- `apps/reader/Dockerfile`: always-on local container for the reader UI
-- `apps/rag/src/*.py`: sync, ingest, query, and Chroma inspection
-- `Makefile`: user-facing commands
-- `.env.example`: environment template
-- `README.md`: user documentation
+- `apps/scraper/src/scraper/index.ts`: CLI entry point (dispatch only)
+- `cli-options.ts`: flags + environment -> options
+- `pipeline.ts`: ingest, scrape queue, rescan, run, status, backup, URL list export/requeue, snapshots
+- `freedium.ts`: browser session, Freedium loading and extraction
+- `freedium-data.ts`, `markdown.ts`: embedded-data parser, Markdown cleanup
+- `output.ts`: `.txt`/`.json` writing; `db.ts`: `library.db`
+- `drive.ts`, `oauth.ts`: Google Drive/Docs API and OAuth
+- `urls.ts`, `text.ts`, `log.ts`, `types.ts`: shared helpers
+- `apps/scraper/src/tests/`, `apps/reader/test/`, `apps/rag/tests/`: unit tests (`make test`)
+- `apps/reader/src/server.js`: reader (cache, FTS5 search, Markdown rendering, API)
+- `apps/rag/src/`: `sync.py`, `tag.py`, `ingest.py`, `query.py`, `vectorstore.py`, `mcp_server.py`, `index_inspect.py`, `common.py`
+- `Makefile`: all user-facing commands; `.env.example`: settings
+- `deploy/systemd/`: optional nightly timer units
+- `docs/PLAN.md`: history of the improvement phases

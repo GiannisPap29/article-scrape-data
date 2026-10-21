@@ -1,0 +1,17 @@
+# Rendered by `make schedule-install` (@ROOT_DIR@ = this checkout).
+[Unit]
+Description=web-scrapper: Drive MEDIUM -> Freedium -> library -> RAG index
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ROOT_DIR@
+# No desktop session at night: always headless. Passed on the make command
+# line because values from .env (HEADLESS=false) override plain environment.
+ExecStart=/usr/bin/make --no-print-directory -C @ROOT_DIR@ run HEADLESS=true
+# Background work: yield CPU and disk to anything interactive.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h
+# make exits 0 (all good) or 2 (something to look at); notify either way.
+ExecStopPost=-/bin/sh -c 'if [ "$EXIT_STATUS" = 0 ]; then msg="Finished. New articles are in the library."; else msg="Finished with problems. Run: make status"; fi; /usr/bin/notify-send "web-scrapper" "$msg"'

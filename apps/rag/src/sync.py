@@ -10,9 +10,23 @@ from common import (
     ensure_directories,
     load_json,
     load_manifest,
+    resolve_text_path,
     save_manifest,
     utc_now_iso,
     validate_sidecar,
+)
+
+# Manifest fields owned by ingest/tag steps; a sync must carry them over.
+PRESERVED_FIELDS = (
+    "last_ingested_hash",
+    "chunk_count",
+    "chunk_version",
+    "indexed_at",
+    "collection",
+    "embed_model",
+    "auto_tags",
+    "auto_tags_model",
+    "status",
 )
 
 
@@ -28,47 +42,59 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def sync_documents(source_dir: Path, limit: int | None) -> tuple[int, int]:
+def sync_documents(source_dir: Path, limit: int | None) -> dict[str, int]:
     ensure_directories()
     manifest = load_manifest()
-    imported = 0
-    skipped = 0
+    documents = manifest["documents"]
+    counts = {"new_or_changed": 0, "unchanged": 0, "invalid": 0, "removed": 0}
+    seen: set[str] = set()
 
     sidecar_paths = sorted(source_dir.glob("*.json"))
     if limit is not None:
         sidecar_paths = sidecar_paths[:limit]
 
     for sidecar_path in sidecar_paths:
-        sidecar = load_json(sidecar_path)
-        validate_sidecar(sidecar, sidecar_path)
+        # One broken sidecar must not stop the whole sync: report and continue.
+        try:
+            sidecar = load_json(sidecar_path)
+            validate_sidecar(sidecar, sidecar_path)
+            txt_path = resolve_text_path(sidecar, sidecar_path)
+            if not txt_path.exists():
+                raise FileNotFoundError(f"missing text file {txt_path.name}")
+            document = build_imported_document(sidecar, sidecar_path)
+        except Exception as exc:  # noqa: BLE001 - reported, then skipped
+            counts["invalid"] += 1
+            print(f"sync: skipped {sidecar_path.name}: {exc}")
+            continue
 
-        txt_path = Path(sidecar["outputPath"])
-        if not txt_path.exists():
-            raise FileNotFoundError(f"Missing text file for {sidecar_path}: {txt_path}")
+        seen.add(document.doc_id)
+        existing = documents.get(document.doc_id)
+        unchanged = bool(existing) and existing.get("content_hash") == document.content_hash
 
-        document = build_imported_document(sidecar, sidecar_path)
-        existing = manifest["documents"].get(document.doc_id)
-        unchanged = existing and existing.get("content_hash") == document.content_hash
-
-        # Preserve ingest bookkeeping across sync runs. A metadata-only sync
+        # Preserve ingest/tag bookkeeping across sync runs. A metadata-only sync
         # should not make an already indexed, unchanged document look new.
         record = document_record_payload(document)
         if existing:
-            for key in ("last_ingested_hash", "chunk_count", "indexed_at", "collection"):
+            for key in PRESERVED_FIELDS:
                 if key in existing:
                     record[key] = existing[key]
+        if not unchanged or record.get("status") in {None, "removed", "missing_source_text", "empty_source_text"}:
+            record["status"] = "synced"
         record["imported_at"] = utc_now_iso()
-        record["status"] = "synced"
-        manifest["documents"][document.doc_id] = record
+        documents[document.doc_id] = record
+        counts["unchanged" if unchanged else "new_or_changed"] += 1
 
-        if unchanged:
-            skipped += 1
-        else:
-            imported += 1
+    # Documents whose sidecar is gone from data/output: ingest deletes their
+    # chunks and then drops the record. Skipped when --limit hides the rest.
+    if limit is None:
+        for doc_id, record in documents.items():
+            if doc_id not in seen and record.get("status") != "removed":
+                record["status"] = "removed"
+                counts["removed"] += 1
 
     manifest["last_sync_at"] = utc_now_iso()
     save_manifest(manifest)
-    return imported, skipped
+    return counts
 
 
 def main() -> None:
@@ -77,8 +103,12 @@ def main() -> None:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
 
-    imported, skipped = sync_documents(source_dir, args.limit)
-    print(f"sync complete: imported_or_updated={imported} unchanged={skipped}")
+    counts = sync_documents(source_dir, args.limit)
+    print(
+        "sync complete: "
+        f"new_or_changed={counts['new_or_changed']} unchanged={counts['unchanged']} "
+        f"invalid={counts['invalid']} marked_removed={counts['removed']}"
+    )
 
 
 if __name__ == "__main__":

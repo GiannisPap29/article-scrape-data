@@ -7,8 +7,11 @@ services:
       PORT: "3010"
       READER_HOST: 0.0.0.0
       READER_OUTPUT_DIR: /app/data/output
+      READER_MANIFEST_PATH: /app/data/state/manifest.json
     ports:
       - "127.0.0.1:3010:3010"
     restart: unless-stopped
     volumes:
       - ./data/output:/app/data/output:ro
+      # RAG manifest, only read for auto tags (make rag-tag); optional.
+      - ./data/state:/app/data/state:ro
