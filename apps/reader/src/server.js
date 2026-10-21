@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -9,6 +10,11 @@ const PROJECT_ROOT = path.resolve(__dirname, "../../..");
 const OUTPUT_DIR = path.resolve(process.env.READER_OUTPUT_DIR ?? path.join(PROJECT_ROOT, "data/output"));
 const DEFAULT_PORT = 3010;
 const DEFAULT_HOST = process.env.READER_HOST ?? "127.0.0.1";
+// Optional: RAG manifest with locally generated tags for articles that have no
+// Medium tags. Missing or unreadable is fine; the reader just shows no auto tags.
+const MANIFEST_PATH = path.resolve(process.env.READER_MANIFEST_PATH ?? path.join(PROJECT_ROOT, "data/state/manifest.json"));
+// How often a request may trigger a check for changed files on disk.
+const REFRESH_INTERVAL_MS = 2000;
 
 function parsePort(argv) {
   const arg = argv.find((entry) => entry.startsWith("--port="));
@@ -57,130 +63,267 @@ function toDomain(urlValue) {
   }
 }
 
-function buildTextPath(sidecarPath, outputPath) {
-  const fallbackPath = sidecarPath.replace(/\.json$/i, ".txt");
-  if (!outputPath) {
-    return fallbackPath;
-  }
-
-  // Sidecars may contain host paths from the scraper or mounted container paths.
-  // Resolve by basename inside OUTPUT_DIR so the reader works both locally and
-  // in the Docker container.
-  const outputBasename = path.basename(outputPath);
-  const mountedOutputPath = path.join(OUTPUT_DIR, outputBasename);
-
-  if (path.isAbsolute(outputPath)) {
-    if (outputPath.startsWith(`${OUTPUT_DIR}${path.sep}`) || outputPath === mountedOutputPath) {
-      return outputPath;
-    }
-    return mountedOutputPath;
-  }
-
-  const resolved = path.resolve(PROJECT_ROOT, outputPath);
-  if (resolved.startsWith(`${OUTPUT_DIR}${path.sep}`) || path.basename(resolved) === outputBasename) {
-    return mountedOutputPath;
-  }
-
-  return fallbackPath;
+export function buildTextPath(sidecarPath, outputPath) {
+  // v4 sidecars store a bare file name next to the sidecar; v2/v3 stored host
+  // paths that may not exist in the container. Either way the .txt lives next
+  // to its .json, and basename() keeps the lookup inside OUTPUT_DIR.
+  const fileName = outputPath ? path.basename(outputPath) : path.basename(sidecarPath).replace(/\.json$/i, ".txt");
+  return path.join(path.dirname(sidecarPath), fileName);
 }
 
 function tokenize(values) {
   return [...new Set(values.filter(Boolean).map((value) => String(value).trim()).filter(Boolean).sort((a, b) => a.localeCompare(b)))];
 }
 
-export async function loadArticles() {
-  const entries = await readdir(OUTPUT_DIR, { withFileTypes: true });
-  const sidecars = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
-  const articles = [];
+function parseArticle(sidecarName, sidecarPath, metadata, textPath, body) {
+  const tags = Array.isArray(metadata.tags) ? metadata.tags.map((tag) => String(tag)) : [];
+  const author = metadata.author ? String(metadata.author) : "";
+  const freediumUrl = metadata.freediumUrl || metadata.freedium?.url || "";
+  const article = {
+    author,
+    autoTags: [],
+    batchId: metadata.batchId ? String(metadata.batchId) : "",
+    body,
+    contentFormat: metadata.contentFormat === "markdown" ? "markdown" : "text",
+    contentHash: metadata.contentHash ? String(metadata.contentHash) : "",
+    coverImage: typeof metadata.coverImage === "string" && /^https?:\/\//u.test(metadata.coverImage) ? metadata.coverImage : "",
+    docId: String(metadata.docId ?? path.basename(sidecarName, ".json")),
+    domain: toDomain(metadata.sourceUrl),
+    excerpt: metadata.excerpt ? String(metadata.excerpt) : "",
+    freedium: metadata.freedium ?? {},
+    freediumUrl: String(freediumUrl),
+    language: metadata.language ? String(metadata.language) : "",
+    metadataPath: String(metadata.metadataPath ?? sidecarPath),
+    path: textPath,
+    publishedAt: metadata.publishedAt ? String(metadata.publishedAt) : "",
+    readingTimeMinutes: Number.isInteger(metadata.readingTimeMinutes) ? metadata.readingTimeMinutes : null,
+    scrapedAt: metadata.scrapedAt ? String(metadata.scrapedAt) : "",
+    sourceUrl: metadata.sourceUrl ? String(metadata.sourceUrl) : "",
+    outputPath: String(metadata.outputPath ?? textPath),
+    siteName: metadata.siteName ? String(metadata.siteName) : "",
+    scraperMetadataVersion: metadata.scraperMetadataVersion ?? null,
+    tags,
+    title: metadata.title ? String(metadata.title) : path.basename(sidecarName, ".json"),
+    wordCount: body.trim() ? body.trim().split(/\s+/).length : 0
+  };
+  // Lowercased once per file change instead of on every search request.
+  article.searchText = [
+    article.title,
+    article.author,
+    article.siteName,
+    article.excerpt,
+    article.sourceUrl,
+    article.freediumUrl,
+    article.tags.join(" "),
+    article.body
+  ].join(" ").toLowerCase();
+  return article;
+}
 
-  // JSON sidecars are the catalogue. Missing or invalid sidecars are skipped so
-  // one bad scrape artifact does not prevent the reader from starting.
-  for (const entry of sidecars) {
-    const sidecarPath = path.join(OUTPUT_DIR, entry.name);
+// Tags shown and filtered on: real Medium tags first, local auto tags otherwise.
+export function articleTags(article) {
+  return article.tags.length > 0 ? article.tags : article.autoTags;
+}
+
+const articleCache = new Map();
+const manifestCache = { mtimeMs: null, tagsByDocId: new Map() };
+let sortedArticles = [];
+let lastRefreshAt = 0;
+let refreshInFlight = null;
+
+async function fileMtime(filePath) {
+  try {
+    return (await stat(filePath)).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshAutoTags() {
+  const mtimeMs = await fileMtime(MANIFEST_PATH);
+  if (mtimeMs === manifestCache.mtimeMs) {
+    return false;
+  }
+  manifestCache.mtimeMs = mtimeMs;
+  manifestCache.tagsByDocId = new Map();
+  if (mtimeMs !== null) {
+    try {
+      const manifest = JSON.parse(await readFile(MANIFEST_PATH, "utf8"));
+      for (const [docId, record] of Object.entries(manifest.documents ?? {})) {
+        if (Array.isArray(record.auto_tags) && record.auto_tags.length > 0) {
+          manifestCache.tagsByDocId.set(docId, record.auto_tags.map((tag) => String(tag)));
+        }
+      }
+    } catch {
+      // A manifest being rewritten mid-read is retried on the next refresh.
+      manifestCache.mtimeMs = null;
+    }
+  }
+  return true;
+}
+
+async function refreshArticles() {
+  const entries = await readdir(OUTPUT_DIR, { withFileTypes: true });
+  const sidecarNames = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map((entry) => entry.name);
+  let changed = false;
+
+  // JSON sidecars are the catalogue. Only re-read a pair when the .json or
+  // .txt modification time changed. Invalid sidecars are skipped so one bad
+  // scrape artifact does not break the reader.
+  for (const sidecarName of sidecarNames) {
+    const sidecarPath = path.join(OUTPUT_DIR, sidecarName);
+    const cached = articleCache.get(sidecarName);
+    const jsonMtime = await fileMtime(sidecarPath);
+    const cachedTextPath = cached?.article?.path ?? sidecarPath.replace(/\.json$/i, ".txt");
+    const textMtime = await fileMtime(cachedTextPath);
+    if (cached && cached.jsonMtime === jsonMtime && cached.textMtime === textMtime) {
+      continue;
+    }
+
+    changed = true;
     let metadata;
     try {
       metadata = JSON.parse(await readFile(sidecarPath, "utf8"));
     } catch {
+      articleCache.set(sidecarName, { article: null, jsonMtime, textMtime });
       continue;
     }
 
     const textPath = buildTextPath(sidecarPath, metadata.outputPath);
-    let body = "";
-    try {
-      body = await readFile(textPath, "utf8");
-    } catch {
-      body = "";
-    }
-
-    const tags = Array.isArray(metadata.tags) ? metadata.tags.map((tag) => String(tag)) : [];
-    const author = metadata.author ? String(metadata.author) : "";
-    const language = metadata.language ? String(metadata.language) : "";
-    const freediumUrl = metadata.freediumUrl || metadata.freedium?.url || "";
-    const domain = toDomain(metadata.sourceUrl);
-    const wordCount = body.trim() ? body.trim().split(/\s+/).length : 0;
-
-    articles.push({
-      author,
-      authorBio: metadata.authorBio ? String(metadata.authorBio) : "",
-      authorUrl: metadata.authorUrl ? String(metadata.authorUrl) : "",
-      batchId: metadata.batchId ? String(metadata.batchId) : "",
-      body,
-      contentHash: metadata.contentHash ? String(metadata.contentHash) : "",
-      docId: String(metadata.docId ?? path.basename(entry.name, ".json")),
-      domain,
-      excerpt: metadata.excerpt ? String(metadata.excerpt) : "",
-      freedium: metadata.freedium ?? {},
-      freediumUrl: String(freediumUrl),
-      language,
-      metadataPath: String(metadata.metadataPath ?? sidecarPath),
-      path: textPath,
-      publishedAt: metadata.publishedAt ? String(metadata.publishedAt) : "",
-      scrapedAt: metadata.scrapedAt ? String(metadata.scrapedAt) : "",
-      sourceUrl: metadata.sourceUrl ? String(metadata.sourceUrl) : "",
-      outputPath: String(metadata.outputPath ?? textPath),
-      siteName: metadata.siteName ? String(metadata.siteName) : "",
-      scraperMetadataVersion: metadata.scraperMetadataVersion ?? null,
-      tags,
-      title: metadata.title ? String(metadata.title) : path.basename(entry.name, ".json"),
-      wordCount
+    const body = await readFile(textPath, "utf8").catch(() => "");
+    articleCache.set(sidecarName, {
+      article: parseArticle(sidecarName, sidecarPath, metadata, textPath, body),
+      jsonMtime,
+      textMtime: await fileMtime(textPath)
     });
   }
 
-  articles.sort((left, right) =>
-    String(right.publishedAt || right.scrapedAt).localeCompare(String(left.publishedAt || left.scrapedAt))
-  );
-  return articles;
+  const present = new Set(sidecarNames);
+  for (const sidecarName of articleCache.keys()) {
+    if (!present.has(sidecarName)) {
+      articleCache.delete(sidecarName);
+      changed = true;
+    }
+  }
+
+  const tagsChanged = await refreshAutoTags();
+  if (changed || tagsChanged) {
+    sortedArticles = [...articleCache.values()]
+      .map((entry) => entry.article)
+      .filter(Boolean)
+      .sort((left, right) =>
+        String(right.publishedAt || right.scrapedAt).localeCompare(String(left.publishedAt || left.scrapedAt))
+      );
+    for (const article of sortedArticles) {
+      article.autoTags = manifestCache.tagsByDocId.get(article.docId) ?? [];
+    }
+    rebuildSearchIndex(sortedArticles);
+  }
 }
 
-export function filterArticles(articles, query) {
+// Full-text search: an in-memory SQLite FTS5 index rebuilt from the cache
+// whenever files change (the reader never writes to disk). Porter stemming
+// matches "errors" with "error"; bm25 weights rank title and tags above body.
+const searchDb = new DatabaseSync(":memory:");
+searchDb.exec(`
+  CREATE VIRTUAL TABLE articles_fts USING fts5(
+    doc_id UNINDEXED, title, tags, author, excerpt, body,
+    tokenize = 'porter unicode61 remove_diacritics 2'
+  );
+`);
+const SEARCH_WEIGHTS = "0, 10, 6, 4, 3, 1";
+const SNIPPET_OPEN = "\u0001";
+const SNIPPET_CLOSE = "\u0002";
+
+function rebuildSearchIndex(articles) {
+  const insert = searchDb.prepare("INSERT INTO articles_fts (doc_id, title, tags, author, excerpt, body) VALUES (?, ?, ?, ?, ?, ?)");
+  searchDb.exec("BEGIN");
+  try {
+    searchDb.exec("DELETE FROM articles_fts");
+    for (const article of articles) {
+      insert.run(article.docId, article.title, articleTags(article).join(" "), article.author, article.excerpt, article.body);
+    }
+    searchDb.exec("COMMIT");
+  } catch (error) {
+    searchDb.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export function toFtsQuery(text) {
+  // Every word must match (AND), as a quoted prefix so "kube" finds
+  // "kubernetes" and user punctuation can never break the FTS syntax.
+  const terms = String(text).toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  return terms.slice(0, 12).map((term) => `"${term}"*`).join(" ");
+}
+
+// Returns Map(docId -> { rank, snippet }) or null when there is nothing to search.
+export function searchArticles(text) {
+  const query = toFtsQuery(text);
+  if (!query) {
+    return null;
+  }
+  const rows = searchDb
+    .prepare(`
+      SELECT doc_id AS docId,
+             bm25(articles_fts, ${SEARCH_WEIGHTS}) AS score,
+             snippet(articles_fts, 5, '${SNIPPET_OPEN}', '${SNIPPET_CLOSE}', ' … ', 18) AS snippet
+      FROM articles_fts
+      WHERE articles_fts MATCH ?
+      ORDER BY score
+      LIMIT 500
+    `)
+    .all(query);
+  return new Map(rows.map((row, rank) => [row.docId, { rank, snippet: row.snippet }]));
+}
+
+function renderSnippet(snippet) {
+  // Escape first, then turn the FTS markers into <mark>; Markdown symbols in
+  // the raw body are stripped so the snippet reads like plain text.
+  const plain = String(snippet).replace(/[#*_`>]+/gu, " ").replace(/!?\[([^\]]*)\]\([^)]*\)/gu, "$1").replace(/\s+/gu, " ");
+  return escapeHtml(plain).replaceAll(SNIPPET_OPEN, "<mark>").replaceAll(SNIPPET_CLOSE, "</mark>");
+}
+
+export async function loadArticles() {
+  // Serve from memory; check the disk at most every REFRESH_INTERVAL_MS, and
+  // let concurrent requests share one refresh.
+  if (Date.now() - lastRefreshAt >= REFRESH_INTERVAL_MS) {
+    refreshInFlight ??= refreshArticles().finally(() => {
+      lastRefreshAt = Date.now();
+      refreshInFlight = null;
+    });
+  }
+  if (refreshInFlight) {
+    await refreshInFlight;
+  }
+  return sortedArticles;
+}
+
+export function filterArticles(articles, query, searchResults = undefined) {
   const searchQuery = (query.q ?? "").trim().toLowerCase();
   const titleQuery = (query.title ?? "").trim().toLowerCase();
   const tag = (query.tag ?? "").trim();
   const author = (query.author ?? "").trim();
   const language = (query.language ?? "").trim();
   const domain = (query.domain ?? "").trim();
-  const sort = (query.sort ?? "published").trim();
+  // A search defaults to best match first; browsing defaults to newest first.
+  const sort = (query.sort || (searchQuery && searchResults ? "relevance" : "published")).trim();
 
+  // Sorting below must not reorder the shared cached array.
   let filtered = articles.filter((article) => {
     if (searchQuery) {
-      const searchable = [
-        article.title,
-        article.author,
-        article.siteName,
-        article.excerpt,
-        article.sourceUrl,
-        article.freediumUrl,
-        article.tags.join(" "),
-        article.body
-      ].join(" ").toLowerCase();
-      if (!searchable.includes(searchQuery)) {
+      if (searchResults) {
+        if (!searchResults.has(article.docId)) {
+          return false;
+        }
+      } else if (!article.searchText.includes(searchQuery) && !article.autoTags.join(" ").includes(searchQuery)) {
         return false;
       }
     }
     if (titleQuery && !article.title.toLowerCase().includes(titleQuery)) {
       return false;
     }
-    if (tag && !article.tags.includes(tag)) {
+    if (tag && !articleTags(article).includes(tag)) {
       return false;
     }
     if (author && article.author !== author) {
@@ -195,7 +338,9 @@ export function filterArticles(articles, query) {
     return true;
   });
 
-  if (sort === "oldest") {
+  if (sort === "relevance" && searchResults) {
+    filtered = filtered.sort((left, right) => searchResults.get(left.docId).rank - searchResults.get(right.docId).rank);
+  } else if (sort === "oldest") {
     filtered = filtered.sort((left, right) =>
       String(left.publishedAt || left.scrapedAt).localeCompare(String(right.publishedAt || right.scrapedAt))
     );
@@ -214,6 +359,16 @@ export function filterArticles(articles, query) {
   return filtered;
 }
 
+function renderTagChips(article, limit = Infinity) {
+  const auto = article.tags.length === 0 && article.autoTags.length > 0;
+  // Auto tags are dashed and titled so they are never mistaken for Medium tags.
+  const attributes = auto ? ' class="chip chip-auto" title="Generated locally by make rag-tag"' : ' class="chip"';
+  return articleTags(article)
+    .slice(0, limit)
+    .map((tag) => `<a${attributes} href="/?tag=${encodeURIComponent(tag)}">${escapeHtml(tag)}</a>`)
+    .join("");
+}
+
 function renderOptions(values, selectedValue, placeholder) {
   const defaultOption = placeholder ? `<option value="">${escapeHtml(placeholder)}</option>` : "";
   const items = values.map((value) => {
@@ -223,74 +378,144 @@ function renderOptions(values, selectedValue, placeholder) {
   return [defaultOption, ...items].join("");
 }
 
-function renderRichBody(content) {
+const SAFE_URL = /^(https?:\/\/|mailto:|#)/iu;
+
+function renderEmphasis(html) {
+  return html
+    .replace(/\*\*(.+?)\*\*/gu, "<strong>$1</strong>")
+    .replace(/__(.+?)__/gu, "<strong>$1</strong>")
+    .replace(/~~(.+?)~~/gu, "<del>$1</del>")
+    .replace(/(^|[^\w*])\*(?!\s)(.+?)\*(?!\w)/gu, "$1<em>$2</em>")
+    .replace(/(^|[^\w])_(?!\s)(.+?)_(?!\w)/gu, "$1<em>$2</em>");
+}
+
+function renderInline(text) {
+  // Escape first, then add a small, safe subset of inline Markdown. Code spans,
+  // images, and link targets are swapped out for placeholders so emphasis rules
+  // never touch them (Medium image ids contain "*", URLs contain "_").
+  const tokens = [];
+  const stash = (html) => {
+    tokens.push(html);
+    return `\u0000${tokens.length - 1}\u0000`;
+  };
+
+  let html = escapeHtml(text).replace(/`([^`]+)`/gu, (_match, code) => stash(`<code>${code}</code>`));
+  html = html.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/gu, (match, alt, url) =>
+    SAFE_URL.test(url) ? stash(`<img src="${url}" alt="${alt}" loading="lazy">`) : match
+  );
+  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/gu, (_match, label, url) =>
+    SAFE_URL.test(url)
+      ? stash(`<a href="${url}" target="_blank" rel="noopener noreferrer">${renderEmphasis(label)}</a>`)
+      : label
+  );
+
+  return renderEmphasis(html).replace(/\u0000(\d+)\u0000/gu, (_match, index) => tokens[Number(index)]);
+}
+
+export function renderRichBody(content) {
   if (!content.trim()) {
     return "<p>Article body is missing.</p>";
   }
 
+  // Renders the scraper's Markdown (v4 "markdown" bodies and the simpler
+  // Markdown-like v2/v3 "text" bodies) without a third-party parser.
   const lines = content.replace(/\r\n/g, "\n").split("\n");
   const blocks = [];
-  let paragraph = [];
-  let inCodeBlock = false;
-  let codeLines = [];
+  let index = 0;
 
-  const flushParagraph = () => {
-    if (paragraph.length === 0) {
-      return;
+  const isBlank = (line) => !line.trim();
+  const listItem = (line) => line.match(/^\s*(?:([-*+])|(\d+)[.)])\s+(.*)$/u);
+  const startsBlock = (line) =>
+    /^\s*(```|~~~)/u.test(line) || /^#{1,6}\s/u.test(line) || /^\s*>/u.test(line) || Boolean(listItem(line)) ||
+    /^\s*!\[[^\]]*\]\([^)]+\)\s*$/u.test(line) || /^\s*([-*_])(\s*\1){2,}\s*$/u.test(line);
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (isBlank(line)) {
+      index += 1;
+      continue;
     }
-    blocks.push(`<p>${escapeHtml(paragraph.join(" "))}</p>`);
-    paragraph = [];
-  };
 
-  // Render the scraper's small Markdown-like format without pulling in a full
-  // Markdown parser for this local-only reader.
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-
-    if (trimmed === "```") {
-      flushParagraph();
-      if (inCodeBlock) {
-        blocks.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
-        codeLines = [];
-        inCodeBlock = false;
-      } else {
-        inCodeBlock = true;
+    const fence = trimmed.match(/^(```|~~~)\s*([\w+#.-]*)/u);
+    if (fence) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && lines[index].trim() !== fence[1]) {
+        code.push(lines[index]);
+        index += 1;
       }
+      index += 1;
+      const language = fence[2] ? ` class="language-${escapeHtml(fence[2])}" data-lang="${escapeHtml(fence[2])}"` : "";
+      blocks.push(`<pre${language}><code>${escapeHtml(code.join("\n"))}</code></pre>`);
       continue;
     }
 
-    if (inCodeBlock) {
-      codeLines.push(rawLine);
+    const heading = trimmed.match(/^(#{1,6})\s+(.*)$/u);
+    if (heading) {
+      const level = Math.min(6, Math.max(2, heading[1].length));
+      blocks.push(`<h${level}>${renderInline(heading[2].replace(/\s+#+$/u, ""))}</h${level}>`);
+      index += 1;
       continue;
     }
 
-    const imageMatch = trimmed.match(/^!\[(.*)\]\((https?:\/\/.+)\)$/u);
-    if (imageMatch) {
-      flushParagraph();
-      const [, alt, src] = imageMatch;
+    if (/^([-*_])(\s*\1){2,}$/u.test(trimmed)) {
+      blocks.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    const image = trimmed.match(/^!\[([^\]]*)\]\(([^)\s]+)\)$/u);
+    if (image && SAFE_URL.test(image[2])) {
+      const [, alt, src] = image;
       blocks.push(
         `<figure class="article-figure"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy">${alt ? `<figcaption>${escapeHtml(alt)}</figcaption>` : ""}</figure>`
       );
+      index += 1;
       continue;
     }
 
-    if (!trimmed) {
-      flushParagraph();
+    if (/^>/u.test(trimmed)) {
+      const quoted = [];
+      while (index < lines.length && /^\s*>/u.test(lines[index])) {
+        quoted.push(lines[index].replace(/^\s*>\s?/u, ""));
+        index += 1;
+      }
+      const paragraphs = quoted.join("\n").split(/\n\s*\n/u).map((part) => `<p>${part.split("\n").map(renderInline).join("<br>")}</p>`);
+      blocks.push(`<blockquote>${paragraphs.join("")}</blockquote>`);
       continue;
     }
 
-    if (trimmed.startsWith("> ")) {
-      flushParagraph();
-      blocks.push(`<blockquote>${escapeHtml(trimmed.slice(2))}</blockquote>`);
+    const firstItem = listItem(line);
+    if (firstItem) {
+      const ordered = Boolean(firstItem[2]);
+      const items = [];
+      while (index < lines.length) {
+        const item = listItem(lines[index]);
+        if (item && Boolean(item[2]) === ordered) {
+          items.push(item[3]);
+        } else if (!isBlank(lines[index]) && /^\s{2,}\S/u.test(lines[index]) && items.length > 0) {
+          items[items.length - 1] += ` ${lines[index].trim()}`;
+        } else {
+          break;
+        }
+        index += 1;
+      }
+      const tag = ordered ? "ol" : "ul";
+      const start = ordered && firstItem[2] !== "1" ? ` start="${Number(firstItem[2])}"` : "";
+      blocks.push(`<${tag}${start}>${items.map((item) => `<li>${renderInline(item)}</li>`).join("")}</${tag}>`);
       continue;
     }
 
-    paragraph.push(trimmed);
-  }
-
-  flushParagraph();
-  if (codeLines.length > 0) {
-    blocks.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+    // Paragraph: consecutive lines until a blank line or another block. Medium
+    // uses single line breaks deliberately, so keep them as <br>.
+    const paragraph = [];
+    while (index < lines.length && !isBlank(lines[index]) && (paragraph.length === 0 || !startsBlock(lines[index]))) {
+      paragraph.push(lines[index].trim());
+      index += 1;
+    }
+    blocks.push(`<p>${paragraph.map(renderInline).join("<br>")}</p>`);
   }
 
   return blocks.join("\n");
@@ -515,6 +740,23 @@ function pageShell(title, body) {
       color: #16463b;
       font-size: 0.82rem;
     }
+    a.chip { text-decoration: none; }
+    a.chip:hover { text-decoration: none; filter: brightness(0.95); }
+    .chip-auto {
+      background: transparent;
+      border: 1px dashed rgba(29, 107, 87, 0.45);
+    }
+    .snippet {
+      margin: 0 0 0.6rem;
+      color: var(--muted);
+      font: 0.9rem/1.5 system-ui, sans-serif;
+    }
+    .snippet mark {
+      background: rgba(202, 163, 92, 0.35);
+      color: inherit;
+      border-radius: 3px;
+      padding: 0 0.1rem;
+    }
     .excerpt {
       margin: 0.4rem 0 0.8rem;
       color: #423a31;
@@ -569,6 +811,42 @@ function pageShell(title, body) {
     }
     .article-body code {
       font-family: "SFMono-Regular", Consolas, monospace;
+    }
+    .article-body h2, .article-body h3, .article-body h4, .article-body h5, .article-body h6 {
+      margin: 1.8rem 0 0.7rem;
+      line-height: 1.25;
+      letter-spacing: -0.01em;
+    }
+    .article-body h2 { font-size: 1.6rem; }
+    .article-body h3 { font-size: 1.35rem; }
+    .article-body h4, .article-body h5, .article-body h6 { font-size: 1.12rem; }
+    .article-body ul, .article-body ol { margin: 0 0 1rem; padding-left: 1.6rem; }
+    .article-body li { margin: 0.25rem 0; }
+    .article-body hr { border: 0; border-top: 1px solid var(--line); margin: 2rem 0; }
+    .article-body :not(pre) > code {
+      padding: 0.1rem 0.35rem;
+      border-radius: 6px;
+      background: rgba(31, 27, 22, 0.07);
+      font-size: 0.92em;
+    }
+    .article-body pre[data-lang]::before {
+      content: attr(data-lang);
+      display: block;
+      margin-bottom: 0.5rem;
+      color: #9aa4af;
+      font: 600 0.72rem system-ui, sans-serif;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .article-body blockquote p:last-child { margin-bottom: 0; }
+    .article-cover {
+      width: 100%;
+      max-height: 420px;
+      object-fit: cover;
+      display: block;
+      border-radius: 18px;
+      margin-bottom: 1rem;
+      border: 1px solid rgba(31, 27, 22, 0.08);
     }
     .article-body blockquote {
       padding: 0.8rem 1rem;
@@ -633,9 +911,20 @@ ${body}
 </html>`;
 }
 
+function safeSearch(text) {
+  try {
+    return searchArticles(text) ?? undefined;
+  } catch (error) {
+    // Never fail the page over search: fall back to plain substring matching.
+    console.error(`search failed, using substring match: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
 export function renderIndex(articles, query) {
-  const filtered = filterArticles(articles, query);
-  const tags = tokenize(articles.flatMap((article) => article.tags));
+  const searchResults = (query.q ?? "").trim() ? safeSearch(query.q) : undefined;
+  const filtered = filterArticles(articles, query, searchResults);
+  const tags = tokenize(articles.flatMap((article) => articleTags(article)));
   const authors = tokenize(articles.map((article) => article.author));
   const languages = tokenize(articles.map((article) => article.language));
   const domains = tokenize(articles.map((article) => article.domain));
@@ -651,10 +940,7 @@ export function renderIndex(articles, query) {
           ]
             .filter(Boolean)
             .join("");
-          const tagChips = article.tags
-            .slice(0, 6)
-            .map((tag) => `<span class="chip">${escapeHtml(tag)}</span>`)
-            .join("");
+          const tagChips = renderTagChips(article, 6);
           const sourceLinks = [
             article.freediumUrl ? `<a class="button small-button" href="${escapeHtml(article.freediumUrl)}" target="_blank" rel="noopener noreferrer">Open in Freedium ↗</a>` : "",
             article.sourceUrl ? `<a class="text-link muted-link" href="${escapeHtml(article.sourceUrl)}" target="_blank" rel="noreferrer">Original ↗</a>` : ""
@@ -667,6 +953,7 @@ export function renderIndex(articles, query) {
   </div>
   <div class="chips">${chips}${tagChips}</div>
   ${article.excerpt ? `<p class="excerpt">${escapeHtml(article.excerpt)}</p>` : ""}
+  ${searchResults?.get(article.docId)?.snippet ? `<p class="snippet">${renderSnippet(searchResults.get(article.docId).snippet)}</p>` : ""}
   <div class="card-actions"><a class="button" href="/article/${encodeURIComponent(article.docId)}">Read article</a>${sourceLinks}</div>
 </article>`;
         })
@@ -689,7 +976,7 @@ export function renderIndex(articles, query) {
       <div class="filter-heading"><h2>Find an article</h2><span class="filter-count">${filtered.length} results</span></div>
       <label for="q">Search everything</label>
       <input id="q" name="q" value="${escapeHtml(query.q ?? "")}" placeholder="Try: Go concurrency, Kubernetes, AI" autofocus>
-      <p class="hint">Searches titles, text, authors, tags, and URLs.</p>
+      <p class="hint">Ranked full-text search over titles, tags, authors, and article text. Word starts match: "kube" finds Kubernetes.</p>
       <details ${query.title || query.tag || query.author || query.language || query.domain ? "open" : ""}>
         <summary>More filters</summary>
       <label for="title">Title search</label>
@@ -703,7 +990,7 @@ export function renderIndex(articles, query) {
       <label for="domain">Source domain</label>
       <select id="domain" name="domain">${renderOptions(domains, query.domain ?? "", "All domains")}</select>
       <label for="sort">Sort</label>
-      <select id="sort" name="sort">${renderOptions(["published", "oldest", "title"], query.sort ?? "published", "Published")}</select>
+      <select id="sort" name="sort">${renderOptions(["relevance", "published", "oldest", "title"], query.sort ?? "", "Auto (best match when searching)")}</select>
       </details>
       <div class="filter-actions">
         <button class="button" type="submit">Search library</button>
@@ -731,16 +1018,13 @@ export function renderArticle(article) {
   ]
     .filter(Boolean)
     .join("");
-  const tags = article.tags.map((tag) => `<span class="chip">${escapeHtml(tag)}</span>`).join("");
-  const author = article.author
-    ? article.authorUrl
-      ? `<a class="text-link" href="${escapeHtml(article.authorUrl)}" target="_blank" rel="noreferrer">${escapeHtml(article.author)}</a>`
-      : escapeHtml(article.author)
-    : "";
+  const tags = renderTagChips(article);
+  const author = article.author ? escapeHtml(article.author) : "";
   const sourceDetails = [
     author ? `By ${author}` : "",
     article.siteName ? escapeHtml(article.siteName) : "",
     article.wordCount ? `${article.wordCount.toLocaleString()} words` : "",
+    article.readingTimeMinutes ? `${article.readingTimeMinutes} min read` : "",
     article.scraperMetadataVersion ? `metadata v${escapeHtml(article.scraperMetadataVersion)}` : ""
   ].filter(Boolean).join(' <span aria-hidden="true">·</span> ');
 
@@ -764,9 +1048,23 @@ export function renderArticle(article) {
     <div class="chips">${chips}${tags}</div>
     ${article.excerpt ? `<p class="excerpt">${escapeHtml(article.excerpt)}</p>` : ""}
   </section>
+  ${article.coverImage ? `<img class="article-cover" src="${escapeHtml(article.coverImage)}" alt="" loading="lazy">` : ""}
   <article class="article-body">${renderRichBody(article.body || "")}</article>
 </main>`
   );
+}
+
+function toApiArticle(article, includeBody) {
+  const { body, searchText, ...rest } = article;
+  return { ...rest, effectiveTags: articleTags(article), ...(includeBody ? { body } : {}) };
+}
+
+function sendJson(response, status, payload) {
+  response.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store"
+  });
+  response.end(JSON.stringify(payload));
 }
 
 export async function handler(request, response) {
@@ -780,11 +1078,20 @@ export async function handler(request, response) {
   }
 
   if (url.pathname === "/api/articles") {
-    response.writeHead(200, {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store"
-    });
-    response.end(JSON.stringify(articles));
+    // Catalogue only: bodies are fetched per article, which keeps this
+    // response small (it used to ship every article body, ~8 MB).
+    sendJson(response, 200, articles.map((article) => toApiArticle(article, false)));
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/articles/")) {
+    const docId = decodeURIComponent(url.pathname.slice("/api/articles/".length));
+    const article = articles.find((entry) => entry.docId === docId);
+    if (!article) {
+      sendJson(response, 404, { error: "Article not found" });
+      return;
+    }
+    sendJson(response, 200, toApiArticle(article, true));
     return;
   }
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly web-scrapper run
+
+[Timer]
+OnCalendar=*-*-* 03:30
+RandomizedDelaySec=15min
+# If the machine was off at 03:30, run once at the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

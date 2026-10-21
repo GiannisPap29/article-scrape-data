@@ -1,6 +1,5 @@
 {
   "compilerOptions": {
-    "ignoreDeprecations": "5.0",
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
@@ -12,6 +11,6 @@
     ],
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "declaration": true
+    "incremental": true
   }
 }

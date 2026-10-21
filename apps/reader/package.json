@@ -4,9 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "node src/server.js"
+    "dev": "node --disable-warning=ExperimentalWarning src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.js\""
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.13.0"
   }
 }

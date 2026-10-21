@@ -1,300 +1,215 @@
 # web-scrapper
 
-Medium article extraction plus local RAG over the scraped corpus with Chroma and Gemma 4 through Ollama.
+Save Medium links in a Google Drive folder; this project downloads the full
+articles through [Freedium](https://freedium-mirror.cfd/), keeps them as local
+Markdown files, gives you a reader website with full-text search, and builds a
+local AI index so you (or Claude) can ask questions across everything you saved.
+Everything runs on your machine: Ollama for the AI, SQLite for storage.
 
-## Structure
+## How it works
 
-This repo is split into app folders plus one shared data contract:
+```
+You save a Medium link in Drive → MEDIUM folder
+        │
+ make run
+        ├─ 1. ingest        read MEDIUM; new links → queue; file → MEDIUM_ARCHIVED
+        │                   (already scraped/queued → archived; no valid link → MEDIUM_FAILED)
+        ├─ 2. scrape-queue  open freedium-mirror.cfd/<link>, save .txt (Markdown) + .json (metadata)
+        │                   success → link moves from queue to history; failure → retried later
+        ├─ 3. backup-db     upload data/library.db to Drive MEDIUM/MEDIUM_BACKUPS
+        ├─ 4. rag-sync      tell the AI index about new/changed articles
+        ├─ 5. rag-tag       local AI (gemma3) tags articles that have no tags
+        └─ 6. rag-ingest    split articles into passages, embed them (embeddinggemma)
+        │
+Use it: reader website · make rag-ask · Claude via MCP
+```
 
-- `apps/scraper/`: standalone TypeScript scraper app
-- `apps/reader/`: standalone local Node reader app
-- `apps/rag/`: standalone Python RAG app
-- `data/output/`: scraped `.txt` files and `.json` sidecars; source of truth for documents
-- `data/state/`: RAG manifest state
-- `data/chroma/`: persisted Chroma database
+Three apps share one `data/` folder and nothing else:
 
-The scraper writes `data/output/`. The reader app browses `data/output/` for human reading. The RAG app reads `data/output/` and builds the local vector store. That shared `data/` folder is the only contract between the apps.
+| App | Language | Job |
+|---|---|---|
+| `apps/scraper` | TypeScript (Node 22, Playwright) | Drive, Freedium, article files, `library.db`, backups |
+| `apps/reader` | Node.js, no dependencies | Local reading website with ranked full-text search |
+| `apps/rag` | Python (sqlite-vec, Ollama, MCP) | Tags, AI index, questions, MCP server for Claude |
 
 ## Setup
 
-### Scraper
+Requirements: Node.js 22.13+, Python 3, Google Chrome, [Ollama](https://ollama.com/download), Docker (only for `make reader-up`).
 
 ```bash
-make install
-make browsers
-cp .env.example .env
+cp .env.example .env      # then set DRIVE_FOLDER_ID (the MEDIUM folder id)
+make setup                # npm packages, Python venv, Ollama models
 ```
 
-Google requirements:
+Google access (one time):
 
-- Enable the Google Drive API
-- Enable the Google Docs API
-- Create an OAuth client of type `Desktop app`
-- Put the client JSON at `data/oauth/google-client.json`
+1. In Google Cloud, enable the **Google Drive API** and the **Google Docs API**.
+2. Create an OAuth client of type **Desktop app** and save its JSON as `data/oauth/google-client.json`.
+3. The first Drive command opens a browser to log in; the token is saved to `data/oauth/google-token.json` (only your user can read it).
 
-### RAG
+Drive layout: `MEDIUM/` is the inbox. `MEDIUM_ARCHIVED`, `MEDIUM_FAILED`, and
+`MEDIUM_BACKUPS` are used (and created if missing) inside it, unless you set
+their ids in `.env`. Each file in MEDIUM holds one article link; Google Docs
+and plain text files both work.
 
-Install Ollama locally on Linux:
+## Daily use
 
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh
-ollama -v
+make run          # everything
+make status       # what happened, what failed, what is left to index
+make reader-up    # reader at http://127.0.0.1:3010 (stays on)
+make rag-ask QUESTION="how do I handle errors in Go"
 ```
 
-Start the local Ollama server:
-
-```bash
-ollama serve
-```
-
-In another terminal, pull the default Gemma model used by this repo:
-
-```bash
-ollama pull gemma3:1b
-```
-
-For better answers at the cost of speed and memory, pull Gemma 4 E4B and set
-`RAG_MODEL=gemma4:e4b` in `.env`:
-
-```bash
-ollama pull gemma4:e4b
-```
-
-Create a Python environment and install the local RAG dependencies:
-
-```bash
-python3 -m venv venv
-./venv/bin/pip install --upgrade pip
-./venv/bin/pip install -r apps/rag/requirements.txt
-```
-
-If you want the core Python packages explicitly, they are:
-
-```bash
-./venv/bin/pip install chromadb ollama sentence-transformers
-```
-
-You also need:
-
-- Ollama running locally
-- a local Gemma model available in Ollama, defaulting to `gemma3:1b` (override with `RAG_MODEL`)
-
-### Reader
-
-Run the local article reader UI:
-
-```bash
-make reader
-```
-
-Default address:
-
-```text
-http://127.0.0.1:3010
-```
-
-Run it as an always-on local container:
-
-```bash
-make reader-up
-```
-
-Container address:
-
-```text
-http://127.0.0.1:3010
-```
-
-Useful container commands:
-
-```bash
-make reader-logs
-make reader-down
-```
-
-## Main Flows
-
-### Scraper flow
-
-Stage Drive URLs into the queue DB:
-
-```bash
-make ingest
-```
-
-Scrape the queued URLs and write `.txt` + `.json` output into `data/output/`:
-
-```bash
-make scrape-queue
-```
-
-### RAG flow
-
-Sync scraper sidecars into the RAG manifest:
-
-```bash
-make rag-sync
-```
-
-Chunk, embed, and store documents in Chroma:
-
-```bash
-make rag-ingest
-```
-
-Ask Gemma against the local corpus:
-
-```bash
-make rag-ask QUESTION="best practices for go error handling"
-```
-
-Show retrieved source chunks without calling Gemma:
-
-```bash
-make rag-sources QUESTION="best practices for go error handling"
-```
-
-### Reader flow
-
-Run the local browser UI over the shared article corpus:
-
-```bash
-make reader
-```
-
-Or keep it running all the time through Docker:
-
-```bash
-make reader-up
-```
-
-The reader app provides:
-
-- search over title, excerpt, and tags
-- filters for tag, author, language, and source domain
-- sortable article library
-- full article reading pages sourced from local `.txt` files
+`make run` only does new work: already-scraped links are skipped, and only new
+or changed articles are tagged and indexed. A lock (`data/.run.lock`) stops a
+second `make run` from starting while one is running. Interrupted? Just run it
+again; every step resumes where it stopped.
 
 ## Commands
 
-### Scraper
+`make` prints this list.
 
-- `make ingest`
-- `make scrape-queue`
-- `make show-db`
-- `make backup-db`
-- `make rescan`
-- `make reset-db`
-- `make clean-output`
+| Group | Command | What it does |
+|---|---|---|
+| Every day | `make run` | Everything, steps 1–6 above |
+| | `make status` | Counts, queue errors, how many articles are indexed |
+| Read and ask | `make reader` | Reader website in this terminal |
+| | `make reader-up` / `reader-down` / `reader-logs` | Same, always on in Docker |
+| | `make rag-ask QUESTION=".."` | Answer from your articles, with sources |
+| | `make rag-sources QUESTION=".."` | Only the matching passages, no AI answer (fast) |
+| The steps | `make ingest` | 1. Drive → queue |
+| | `make scrape-queue` | 2. Queue → Freedium → files + history |
+| | `make backup-db` | 3. `library.db` → Drive |
+| | `make rag-sync` | 4. New/changed articles → AI index list |
+| | `make rag-tag` | 5. Auto-tag untagged articles |
+| | `make rag-ingest` | 6. Build the AI index (`FORCE=1` rebuilds all) |
+| Failures | `make retry-failed` | Give failed / gave-up links another try |
+| Safety net | `make export-urls` | All scraped links → `data/backups/scraped-urls.txt` |
+| | `make requeue-urls FILE=..` | Queue links from a text file, then `make run` |
+| | `make rescan` | Re-download every article in the history |
+| Dangerous | `make reset-db` | Delete the scraped history (snapshot saved first) |
+| | `make clean-output` | Delete all article files |
+| | `make clean-debug` | Delete failed-scrape screenshots |
+| Schedule | `make schedule-install` / `schedule-status` / `schedule-remove` | Optional nightly `make run` at 03:30 |
+| Setup | `make setup` | Install / repair everything |
+| | `make test` | Unit tests for all three apps (no network, no real data) |
+| | `make rag-index` / `rag-index-doc DOC_ID=..` | Look inside the AI index |
 
-### RAG
+## Where things are stored
 
-- `make rag-sync`
-- `make rag-ingest`
-- `make rag-reingest`
-- `make rag-sources QUESTION="..."`
-- `make rag-ask QUESTION="..."`
-- `make rag-chroma-count`
-- `make rag-chroma-peek PEEK=3`
-- `make rag-chroma-doc DOC_ID="doc_..."`
+| Path | Contents |
+|---|---|
+| `data/output/` | The articles: `<slug>-<hash>.txt` (body) + `.json` (metadata) |
+| `data/library.db` | SQLite: `scraped_urls` (history) + `url_from_drive` (queue) |
+| `data/backups/` | `scraped-urls.txt` (all links), snapshots before `reset-db` |
+| `data/state/` | AI index: `vectors.db` (sqlite-vec) + `manifest.json` (bookkeeping, auto tags) |
+| `data/debug/` | HTML + screenshot of each failed scrape |
+| `data/oauth/` | Google client + token |
 
-### Reader
+`data/` is git-ignored as a whole.
 
-- `make reader`
-- `make reader-up`
-- `make reader-logs`
-- `make reader-down`
+## Your URL list (safety net)
 
-## RAG Contract
+Your scraped links exist in several places: `data/library.db`,
+`data/backups/scraped-urls.txt` (rewritten by every `make run`), the Drive copy
+`MEDIUM/MEDIUM_BACKUPS/library.db`, and the `sourceUrl` in every `.json`. The
+original link files also stay in `MEDIUM_ARCHIVED`.
 
-The importer reads scraper `*.json` sidecars from `data/output/` and currently accepts `scraperMetadataVersion == 2` or `3`.
+- Article files deleted, database fine → `make rescan`.
+- `library.db` lost → `make requeue-urls FILE=data/backups/scraped-urls.txt`, then `make run`.
+- `make reset-db` first saves `data/backups/library-before-reset-<time>.db` and the link list.
 
-Required fields:
+## Scraping details
 
-- `docId`
-- `contentHash`
-- `sourceUrl`
-- `scrapedAt`
-- `title`
-- `tags`
-- `outputPath`
-- `metadataPath`
-- `batchId`
-- `scraperMetadataVersion`
+- One browser per run, a fresh tab per article, opened as `<FREEDIUM_URL>/<article-url>`.
+  The Freedium homepage form is the fallback, then each mirror in
+  `FREEDIUM_FALLBACK_URLS`. An anti-bot page skips to the next mirror.
+- A random 3–8 s pause (`SCRAPE_DELAY_MS`) separates articles.
+- Failed links are retried on later runs after 15 min, 30 min, 1 h, … up to
+  12 h, at most `MAX_SCRAPE_ATTEMPTS` (5) times; then they show as "gave up" in
+  `make status` until `make retry-failed`. A Freedium "article not found" page
+  gives up immediately.
+- Files are written atomically (temp file + rename), `.txt` before `.json`.
+- Links are normalized (tracking parameters removed, links pasted from any
+  Freedium mirror unwrapped). Medium profile, tag, and reading-list links are
+  rejected.
 
-Optional enrichment:
+## Article format
 
-- `author`
-- `siteName`
-- `excerpt`
-- `publishedAt`
-- `language`
-- `freediumUrl` (the final Freedium URL used to fetch the article; older sidecars use `freedium.url`)
+`.txt`: the article body. Since `scraperMetadataVersion` 4 it is the Markdown
+Freedium embeds in its page: real headings, lists, links, and code blocks with
+their language. Images point to permanent `miro.medium.com` URLs.
 
-## Notes
+`.json` (v4) fields: `docId`, `title`, `author`, `excerpt`, `publishedAt`,
+`readingTimeMinutes`, `coverImage`, `siteName` (`Medium` or the custom domain),
+`sourceUrl`, `freediumUrl`, `freedium` (`free`, `publication`, `updatedAt`,
+`url`), `tags`, `language`, `contentFormat` (`markdown`, or `text` when rebuilt
+from the page HTML), `contentHash`, `scrapedAt`, `batchId`, `outputPath` and
+`metadataPath` (file names next to the `.json`), `scraperMetadataVersion`.
 
-- `data/output/` should remain intact; it is the handoff point between scraper and RAG.
-- The reader container mounts `data/output/` read-only and does not modify article files.
-- `data/state/` and `data/chroma/` are generated local artifacts and are ignored by Git.
-- The default embedding model is `sentence-transformers/all-MiniLM-L6-v2`.
-- The first `rag-ingest` may download model assets if they are not cached yet.
-- The default Ollama model is `gemma3:1b`, configurable with `RAG_MODEL` in `.env` or on the make command line.
+Older v2/v3 files (plain text, absolute paths, sometimes wrong authors) are
+still read by the reader and the AI index; `make rescan` upgrades them.
 
-Official references:
+Tags: Freedium stopped showing Medium tags in 2026-06. A re-scrape keeps tags an
+older `.json` already had; other articles get tags from `make rag-tag`, stored in
+`data/state/manifest.json` (the article files are never changed by the AI app).
 
-- Ollama Linux install: https://docs.ollama.com/linux
-- Gemma 4 model library: https://ollama.com/library/gemma4
-- Chroma Python package: https://pypi.org/project/chromadb/
+## Reader
 
-## Output contract
+- Ranked full-text search (SQLite FTS5 in memory): stemming ("error" finds
+  "errors"), word starts ("kube" finds Kubernetes), highlighted snippets.
+- Filters for tag, author, language, and site; clickable tag chips (auto tags
+  are dashed).
+- Articles render as Markdown with cover image and reading time.
+- New scrapes appear within 2 s, no restart needed.
+- JSON API: `GET /api/articles` (catalogue) and `GET /api/articles/<docId>` (with body).
 
-Each successful scrape now produces two files with the same basename in `data/output/`:
+The Docker container mounts `data/output` and `data/state` read-only.
 
-- `<slug>-<hash>.txt`: clean article body only
-- `<slug>-<hash>.json`: structured metadata for downstream ingestion
+## AI search (RAG)
 
-The metadata sidecar includes:
+- Models run in Ollama: `RAG_EMBED_MODEL` (default `embeddinggemma`) turns
+  passages and questions into vectors; `RAG_MODEL` (default `gemma3:1b`; try
+  `gemma4:e4b` for better answers) writes answers and tags.
+- Articles are split into ~1400-character passages; each embedding model gets
+  its own collection in `data/state/vectors.db` (sqlite-vec, exact cosine search).
+- An article is re-indexed when its text, the embedding model, or the chunking
+  changes; progress is saved after every article. Deleted articles are removed
+  from the index on the next sync + ingest.
+- Answers use at most 2 passages per article so one long article can't fill
+  every source slot.
+- Memory: only one model is loaded at a time, with a capped context. On CPU,
+  indexing takes ~25 s and tagging ~7–20 s per article.
 
-- `docId`
-- `title`
-- `author`
-- `siteName`
-- `excerpt`
-- `sourceUrl`
-- `freediumUrl`
-- `outputPath`
-- `metadataPath`
-- `scrapedAt`
-- `batchId`
-- `contentHash`
-- `tags`
-- `publishedAt`
-- `language`
-- `scraperMetadataVersion`
+### Claude (MCP)
 
-If Freedium exposes trailing hashtag lines like `#golang`, `#programming`, or `#software`, the scraper stores them in `tags` and does not append them to the `.txt` body.
+`.mcp.json` registers the read-only MCP server `medium-library`
+(`apps/rag/src/mcp_server.py`). Start Claude Code in this folder and approve it.
+Tools: `search_articles`, `get_article`, `list_articles`, `library_stats`.
+It needs Ollama running and an indexed library.
 
-The sidecar schema is versioned. `scraperMetadataVersion=2` means:
+## Nightly schedule (optional)
 
-- `title` is the extracted article title when available, with URL-derived fallback only if extraction fails
-- `contentHash` is computed from the final normalized `.txt` body
-- obvious UI artifacts such as standalone `Copy`, `Share`, or duplicate title lines are removed conservatively before writing the `.txt`
+`make schedule-install` adds a systemd user timer: `make run` at 03:30, headless,
+low CPU/disk priority, with a desktop notification. If the machine was off, it
+runs at the next boot. If the Google login expires, the Drive step fails but
+queued links are still scraped; run `make ingest` once by hand to log in again.
 
-## Notes
+## Troubleshooting
 
-- Each Drive file must contain exactly one direct article URL, not a Medium profile/feed/list URL.
-- The ingest stage processes Drive files sequentially in `modifiedTime` ascending order.
-- The queue scrape stage processes queued URLs sequentially in `queued_at` ascending order.
-- `data/url_from_drive.db` is the durable staging queue.
-- `data/scraped-urls.db` is the final success history.
-- `make rescan` ignores the duplicate skip and re-scrapes every tracked `source_url` already stored in `data/scraped-urls.db`.
-- SQLite table: `scraped_urls(source_url, freedium_url, output_path, scraped_at, doc_id, title, author, site_name, excerpt, metadata_path, content_hash, published_at, language, tags_json)`.
-- `make reset-db` clears only SQLite history, not existing output files.
-- `make clean-output` removes local `.txt`, `.json`, `.html`, and `.png` output artifacts.
+| Problem | Fix |
+|---|---|
+| `rag-*` fails with `ModuleNotFoundError` after an OS upgrade | `make setup` (rebuilds the venv) |
+| Google asks to log in again | Run `make ingest` in a terminal and approve in the browser |
+| Every scrape fails | Freedium mirror changed: set `FREEDIUM_URL` / `FREEDIUM_FALLBACK_URLS`; see `data/debug/` |
+| Machine freezes during AI steps | Close heavy apps; run `make rag-tag` and `make rag-ingest` separately |
+| A link "gave up" | `make status` shows why; `make retry-failed` to try again |
 
 ## References
 
-- Google OAuth installed apps: https://developers.google.com/identity/protocols/oauth2/native-app
-- Google Docs `documents.get`: https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/get
+- Google OAuth for desktop apps: https://developers.google.com/identity/protocols/oauth2/native-app
 - Google Drive `files.list`: https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list
-- Google Drive move files between folders: https://developers.google.com/workspace/drive/api/guides/folder
+- Ollama: https://docs.ollama.com/
+- sqlite-vec: https://github.com/asg017/sqlite-vec
+- MCP Python SDK: https://py.sdk.modelcontextprotocol.io/

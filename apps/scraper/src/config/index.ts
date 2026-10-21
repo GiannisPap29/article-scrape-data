@@ -1,8 +1,10 @@
 export const TARGET_URL = "https://freedium-mirror.cfd/";
 export const DEFAULT_OUTPUT_DIR = "data/output";
-export const DEFAULT_DB_FILE = "data/scraped-urls.db";
-export const DEFAULT_URL_QUEUE_DB_FILE = "data/url_from_drive.db";
+export const DEFAULT_DEBUG_DIR = "data/debug";
+export const DEFAULT_BACKUPS_DIR = "data/backups";
 export const DEFAULT_GOOGLE_OAUTH_CLIENT_FILE = "data/oauth/google-client.json";
 export const DEFAULT_GOOGLE_OAUTH_TOKEN_FILE = "data/oauth/google-token.json";
-export const DEFAULT_DRIVE_BACKUP_FILE_NAME = "scraped-urls.db";
+export const DEFAULT_LIBRARY_DB_FILE = "data/library.db";
+export const DEFAULT_DRIVE_BACKUP_FILE_NAME = "library.db";
+export const DEFAULT_RAG_MANIFEST_FILE = "data/state/manifest.json";
 export const GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive";
